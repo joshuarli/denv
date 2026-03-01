@@ -61,11 +61,14 @@ impl TestEnv {
     }
 
     fn denv_in_env(&self, cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> DenvCmd {
+        let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
         let mut cmd = Command::new(denv_bin());
         cmd.args(args)
             .current_dir(cwd)
+            .env("PWD", &canonical_cwd)
             .env("DENV_DATA_DIR", &self.data)
-            .env("__DENV_PID", &self.pid);
+            .env("__DENV_PID", &self.pid)
+            .env("__DENV_SHELL", "fish");
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -92,6 +95,20 @@ struct DenvCmd {
     stdout: String,
     stderr: String,
     success: bool,
+}
+
+impl TestEnv {
+    fn denv_bash(&self, args: &[&str]) -> DenvCmd {
+        self.denv_in_env(&self.proj, args, &[("__DENV_SHELL", "bash")])
+    }
+
+    fn denv_bash_in(&self, cwd: &Path, args: &[&str]) -> DenvCmd {
+        self.denv_in_env(cwd, args, &[("__DENV_SHELL", "bash")])
+    }
+
+    fn allow_bash(&self) -> DenvCmd {
+        self.denv_in_env(&self.proj, &["allow"], &[("__DENV_SHELL", "bash")])
+    }
 }
 
 // --- Tests ---
@@ -168,7 +185,7 @@ fn edit_envrc_invalidates_trust() {
     // mtime changed -> trust revoked: vars unloaded + dirty flag set
     let r = t.denv(&["reload"]);
     assert!(r.stdout.contains("set -e FOO;"));
-    assert!(r.stdout.contains("set -gx __DENV_DIRTY 1;"));
+    assert!(r.stdout.contains("set -gx __DENV_DIRTY '1';"));
     assert!(r.stderr.contains("blocked"));
 }
 
@@ -397,7 +414,7 @@ fn denv_dirty_when_blocked() {
         r.stdout
             .contains(&format!("set -gx __DENV_DIR '{}';", proj.display()))
     );
-    assert!(r.stdout.contains("set -gx __DENV_DIRTY 1;"));
+    assert!(r.stdout.contains("set -gx __DENV_DIRTY '1';"));
 }
 
 #[test]
@@ -407,7 +424,7 @@ fn denv_dirty_cleared_after_allow() {
 
     // First export → blocked, dirty
     let r = t.denv(&["export", "fish"]);
-    assert!(r.stdout.contains("set -gx __DENV_DIRTY 1;"));
+    assert!(r.stdout.contains("set -gx __DENV_DIRTY '1';"));
 
     // Allow + export → activates, clears dirty
     let r = t.allow();
@@ -704,4 +721,218 @@ fn state_var_fast_path_detects_mtime_change() {
         "stdout: {}",
         r.stdout
     );
+}
+
+// --- Bash/Zsh shell tests ---
+
+#[test]
+fn bash_export_syntax() {
+    let t = TestEnv::new();
+    t.write_envrc("export FOO=bar");
+
+    let r = t.allow_bash();
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("export FOO='bar';"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn zsh_export_syntax() {
+    let t = TestEnv::new();
+    t.write_envrc("export FOO=bar");
+
+    let r = t.denv_in_env(&t.proj, &["allow"], &[("__DENV_SHELL", "zsh")]);
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("export FOO='bar';"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn bash_unset_syntax() {
+    let t = TestEnv::new();
+    t.write_envrc("export FOO=bar");
+    t.allow_bash();
+
+    let r = t.denv_bash_in(Path::new("/tmp"), &["export", "bash"]);
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("unset FOO;"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn bash_single_quote_escaping() {
+    let t = TestEnv::new();
+    t.write_envrc(r#"export MSG="it's fine""#);
+
+    let r = t.allow_bash();
+    assert!(
+        r.stdout.contains("export MSG='it'\\''s fine';"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn bash_state_vars() {
+    let t = TestEnv::new();
+    t.write_envrc("export FOO=bar");
+
+    let r = t.allow_bash();
+    let proj = t.proj.canonicalize().unwrap();
+    assert!(
+        r.stdout
+            .contains(&format!("export __DENV_DIR='{}';", proj.display())),
+        "stdout: {}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("unset __DENV_DIRTY;"),
+        "stdout: {}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("export __DENV_STATE="),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn bash_blocked_state() {
+    let t = TestEnv::new();
+    t.write_envrc("export FOO=bar");
+
+    let r = t.denv_bash(&["export", "bash"]);
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("export __DENV_DIRTY='1';"),
+        "stdout: {}",
+        r.stdout
+    );
+    assert!(r.stderr.contains("blocked"));
+}
+
+#[test]
+fn bash_leave_clears_state() {
+    let t = TestEnv::new();
+    t.write_envrc("export FOO=bar");
+    t.allow_bash();
+
+    let r = t.denv_bash_in(Path::new("/tmp"), &["export", "bash"]);
+    assert!(
+        r.stdout.contains("unset __DENV_DIR;"),
+        "stdout: {}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("unset __DENV_DIRTY;"),
+        "stdout: {}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("unset __DENV_STATE;"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn bash_hook_output() {
+    let t = TestEnv::new();
+    let r = t.denv(&["hook", "bash"]);
+    assert!(r.success);
+    assert!(r.stdout.contains("__denv_export()"));
+    assert!(r.stdout.contains("PROMPT_COMMAND="));
+    assert!(r.stdout.contains("export __DENV_PID=$$"));
+    assert!(r.stdout.contains("export __DENV_SHELL=bash"));
+    assert!(r.stdout.contains("denv export bash"));
+}
+
+#[test]
+fn zsh_hook_output() {
+    let t = TestEnv::new();
+    let r = t.denv(&["hook", "zsh"]);
+    assert!(r.success);
+    assert!(r.stdout.contains("__denv_export()"));
+    assert!(r.stdout.contains("add-zsh-hook precmd __denv_export"));
+    assert!(r.stdout.contains("export __DENV_PID=$$"));
+    assert!(r.stdout.contains("export __DENV_SHELL=zsh"));
+    assert!(r.stdout.contains("denv export zsh"));
+}
+
+#[test]
+fn fish_hook_sets_denv_shell() {
+    let t = TestEnv::new();
+    let r = t.denv(&["hook", "fish"]);
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("set -gx __DENV_SHELL fish"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn bash_allow_reexports() {
+    let t = TestEnv::new();
+    t.write_envrc("export FOO=bar");
+
+    // allow with __DENV_SHELL=bash should output bash syntax
+    let r = t.denv_in_env(&t.proj, &["allow"], &[("__DENV_SHELL", "bash")]);
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("export FOO='bar';"),
+        "stdout: {}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("set -gx"),
+        "should not contain fish syntax: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn reload_uses_denv_shell() {
+    let t = TestEnv::new();
+    t.write_envrc("export FOO=bar");
+    t.allow_bash();
+
+    let r = t.denv_bash(&["reload"]);
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("export FOO='bar';"),
+        "stdout: {}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("set -gx"),
+        "should not contain fish syntax: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn export_requires_valid_shell() {
+    let t = TestEnv::new();
+    let r = t.denv(&["export", "powershell"]);
+    assert!(!r.success);
+    assert!(r.stderr.contains("usage"));
+}
+
+#[test]
+fn hook_requires_valid_shell() {
+    let t = TestEnv::new();
+    let r = t.denv(&["hook", "powershell"]);
+    assert!(!r.success);
+    assert!(r.stderr.contains("usage"));
 }

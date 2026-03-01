@@ -1,14 +1,29 @@
 # denv
 
-Minimal direnv for fish shell.
+Minimal direnv.
+
+direnv runs on every `cd` by nature. It's a larger binary and has a whole Go runtime to initialize. Even if it early exits in the noop case it still costs enough to feel the latency. We solve that by being extremely small and noop exiting as past as possible.
+
 
 ## Install
 
-Download to `~/.local/bin/denv` and:
+Download to `~/.local/bin/denv` and add the hook for your shell:
 
+**Fish** (`~/.config/fish/config.fish`):
+```fish
+denv hook fish | source
 ```
-echo 'denv hook fish | source' >> ~/.config/fish/config.fish
+
+**Bash** (`~/.bashrc`):
+```bash
+eval "$(denv hook bash)"
 ```
+
+**Zsh** (`~/.zshrc`):
+```zsh
+eval "$(denv hook zsh)"
+```
+
 
 ## Usage
 
@@ -36,7 +51,7 @@ When both exist, `.env` is loaded after `.envrc` — `.env` wins on conflicts.
 
 ## How it works
 
-On every `cd`, fish runs `denv export fish | source`. denv walks up from the current directory looking for `.envrc` or `.env`. If found and trusted, it spawns one bash subprocess to evaluate the script, diffs the environment before/after, and emits `set -gx`/`set -e` commands for fish to source.
+On every `cd`, the shell hook runs `denv export <shell>`. denv walks up from the current directory looking for `.envrc` or `.env`. If found and trusted, it spawns one bash subprocess to evaluate the script, diffs the environment before/after, and emits shell-appropriate commands (`set -gx`/`export`/`unset`) for the shell to source.
 
 Per-shell state is tracked by PID so multiple terminals stay independent. When you leave a directory, previous values are restored exactly.
 

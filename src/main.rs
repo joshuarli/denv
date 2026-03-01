@@ -9,6 +9,26 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// --- Shell ---
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shell {
+    Fish,
+    Bash,
+    Zsh,
+}
+
+impl Shell {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "fish" => Some(Self::Fish),
+            "bash" => Some(Self::Bash),
+            "zsh" => Some(Self::Zsh),
+            _ => None,
+        }
+    }
+}
+
 // --- Find env files ---
 
 struct EnvFiles {
@@ -428,16 +448,23 @@ fn eval_env(
     Ok(diff_sorted_env(&before, &after))
 }
 
-// --- Fish output ---
+// --- Shell output ---
 
-fn write_fish_escaped(w: &mut impl Write, value: &str) {
+fn write_shell_escaped(w: &mut impl Write, shell: Shell, value: &str) {
     let _ = w.write_all(b"'");
     let bytes = value.as_bytes();
     let mut start = 0;
     for i in 0..bytes.len() {
         if bytes[i] == b'\'' {
             let _ = w.write_all(&bytes[start..i]);
-            let _ = w.write_all(b"\\'");
+            match shell {
+                Shell::Fish => {
+                    let _ = w.write_all(b"\\'");
+                }
+                Shell::Bash | Shell::Zsh => {
+                    let _ = w.write_all(b"'\\''");
+                }
+            }
             start = i + 1;
         }
     }
@@ -445,29 +472,47 @@ fn write_fish_escaped(w: &mut impl Write, value: &str) {
     let _ = w.write_all(b"'");
 }
 
-fn emit_fish_restore(prev: &[PrevVar], stdout: &mut impl Write) {
-    for pv in prev {
-        match pv {
-            PrevVar::Restore(k, v) => {
-                let _ = write!(stdout, "set -gx {} ", k);
-                write_fish_escaped(stdout, v);
-                let _ = writeln!(stdout, ";");
-            }
-            PrevVar::Unset(k) => {
-                writeln!(stdout, "set -e {};", k).unwrap();
-            }
+fn emit_export(w: &mut impl Write, shell: Shell, key: &str, value: &str) {
+    match shell {
+        Shell::Fish => {
+            let _ = write!(w, "set -gx {key} ");
+            write_shell_escaped(w, shell, value);
+            let _ = writeln!(w, ";");
+        }
+        Shell::Bash | Shell::Zsh => {
+            let _ = write!(w, "export {key}=");
+            write_shell_escaped(w, shell, value);
+            let _ = writeln!(w, ";");
         }
     }
 }
 
-fn emit_fish_diff(diff: &EnvDiff, stdout: &mut impl Write) {
+fn emit_unset(w: &mut impl Write, shell: Shell, key: &str) {
+    match shell {
+        Shell::Fish => {
+            writeln!(w, "set -e {key};").unwrap();
+        }
+        Shell::Bash | Shell::Zsh => {
+            writeln!(w, "unset {key};").unwrap();
+        }
+    }
+}
+
+fn emit_restore(prev: &[PrevVar], shell: Shell, out: &mut impl Write) {
+    for pv in prev {
+        match pv {
+            PrevVar::Restore(k, v) => emit_export(out, shell, k, v),
+            PrevVar::Unset(k) => emit_unset(out, shell, k),
+        }
+    }
+}
+
+fn emit_diff(diff: &EnvDiff, shell: Shell, out: &mut impl Write) {
     for (k, v) in &diff.set {
-        let _ = write!(stdout, "set -gx {} ", k);
-        write_fish_escaped(stdout, v);
-        let _ = writeln!(stdout, ";");
+        emit_export(out, shell, k, v);
     }
     for k in &diff.unset {
-        writeln!(stdout, "set -e {};", k).unwrap();
+        emit_unset(out, shell, k);
     }
 }
 
@@ -501,19 +546,25 @@ fn parse_denv_state(s: &str) -> Option<(u64, u64, &str)> {
     Some((envrc_str.parse().ok()?, dotenv_str.parse().ok()?, dir))
 }
 
-fn cmd_export_fish(pid: &str, force: bool) {
+fn cmd_export(pid: &str, force: bool, shell: Shell) {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    let cwd = env::current_dir().expect("cannot get cwd");
+    // Use $PWD from the environment (zero syscalls) instead of getcwd(2)
+    // which does open(".") + fcntl(F_GETPATH) + close on macOS (~1ms).
+    // The shell always sets PWD before invoking denv.
+    let cwd = env::var_os("PWD")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().expect("cannot get cwd"));
     let found = find_env_files(&cwd);
 
     let Some(found) = found else {
         // No .envrc or .env found — restore if we had active state
         if let Some(state) = load_active(pid) {
-            emit_fish_restore(&state.prev, &mut out);
-            out.write_all(b"set -e __DENV_DIR;\nset -e __DENV_DIRTY;\nset -e __DENV_STATE;\n")
-                .unwrap();
+            emit_restore(&state.prev, shell, &mut out);
+            emit_unset(&mut out, shell, "__DENV_DIR");
+            emit_unset(&mut out, shell, "__DENV_DIRTY");
+            emit_unset(&mut out, shell, "__DENV_STATE");
             clear_active(pid);
             print_summary(state.prev.iter().map(|pv| {
                 let k = match pv {
@@ -575,7 +626,7 @@ fn cmd_export_fish(pid: &str, force: bool) {
 
     // Restore previous state before loading new
     if let Some(ref state) = active {
-        emit_fish_restore(&state.prev, &mut out);
+        emit_restore(&state.prev, shell, &mut out);
     }
 
     // .envrc requires trust; .env alone does not
@@ -586,11 +637,9 @@ fn cmd_export_fish(pid: &str, force: bool) {
             "denv: {} is blocked. Run `denv allow` to trust it.",
             envrc_path.display()
         );
-        write!(out, "set -gx __DENV_DIR ").unwrap();
-        write_fish_escaped(&mut out, &dir.to_string_lossy());
-        writeln!(out, ";").unwrap();
-        writeln!(out, "set -gx __DENV_DIRTY 1;").unwrap();
-        writeln!(out, "set -e __DENV_STATE;").unwrap();
+        emit_export(&mut out, shell, "__DENV_DIR", &dir.to_string_lossy());
+        emit_export(&mut out, shell, "__DENV_DIRTY", "1");
+        emit_unset(&mut out, shell, "__DENV_STATE");
         if let Some(ref state) = active {
             print_summary(state.prev.iter().map(|pv| {
                 let k = match pv {
@@ -639,14 +688,20 @@ fn cmd_export_fish(pid: &str, force: bool) {
         }
     }
 
-    emit_fish_diff(&diff, &mut out);
-    write!(out, "set -gx __DENV_DIR ").unwrap();
-    write_fish_escaped(&mut out, &dir.to_string_lossy());
-    writeln!(out, ";").unwrap();
-    writeln!(out, "set -e __DENV_DIRTY;").unwrap();
-    out.write_all(b"set -gx __DENV_STATE '").unwrap();
-    write!(out, "{} {} {}", envrc_mtime, dotenv_mtime, dir.display()).unwrap();
-    out.write_all(b"';\n").unwrap();
+    emit_diff(&diff, shell, &mut out);
+    emit_export(
+        &mut out,
+        shell,
+        "__DENV_DIR",
+        &dir.to_string_lossy(),
+    );
+    emit_unset(&mut out, shell, "__DENV_DIRTY");
+    emit_export(
+        &mut out,
+        shell,
+        "__DENV_STATE",
+        &format!("{} {} {}", envrc_mtime, dotenv_mtime, dir.display()),
+    );
     print_summary(
         diff.set
             .iter()
@@ -680,7 +735,35 @@ function denv --wraps denv
     end
 end
 set -gx __DENV_PID %self
+set -gx __DENV_SHELL fish
 denv export fish | source
+"#;
+
+const BASH_HOOK: &str = r#"__denv_export() { eval "$(command denv export bash)"; }
+denv() {
+    case "$1" in
+        allow|deny|reload) eval "$(command denv "$@")" ;;
+        *) command denv "$@" ;;
+    esac
+}
+export __DENV_PID=$$
+export __DENV_SHELL=bash
+PROMPT_COMMAND="__denv_export${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+eval "$(command denv export bash)"
+"#;
+
+const ZSH_HOOK: &str = r#"__denv_export() { eval "$(command denv export zsh)"; }
+denv() {
+    case "$1" in
+        allow|deny|reload) eval "$(command denv "$@")" ;;
+        *) command denv "$@" ;;
+    esac
+}
+export __DENV_PID=$$
+export __DENV_SHELL=zsh
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd __denv_export
+eval "$(command denv export zsh)"
 "#;
 
 // --- Main ---
@@ -688,7 +771,7 @@ denv export fish | source
 fn run() -> Result<(), String> {
     let cmd = env::args().nth(1);
     let Some(cmd) = cmd.as_deref() else {
-        eprintln!("usage: denv <allow|deny|export fish|reload|hook fish>");
+        eprintln!("usage: denv <allow|deny|export <fish|bash|zsh>|reload|hook <fish|bash|zsh>>");
         std::process::exit(1);
     };
 
@@ -703,28 +786,40 @@ fn run() -> Result<(), String> {
             } else {
                 cmd_deny(&envrc)
             }
-            if let Ok(pid) = env::var("__DENV_PID") {
-                cmd_export_fish(&pid, true);
+            if let (Ok(pid), Ok(shell_str)) =
+                (env::var("__DENV_PID"), env::var("__DENV_SHELL"))
+                && let Some(shell) = Shell::from_str(&shell_str)
+            {
+                cmd_export(&pid, true, shell);
             }
         }
         "export" => {
-            if env::args().nth(2).as_deref() != Some("fish") {
-                return Err("usage: denv export fish".to_string());
-            }
+            let shell_arg = env::args().nth(2);
+            let shell = shell_arg
+                .as_deref()
+                .and_then(Shell::from_str)
+                .ok_or("usage: denv export <fish|bash|zsh>")?;
             let pid =
                 env::var("__DENV_PID").map_err(|_| "__DENV_PID not set (is the hook loaded?)")?;
-            cmd_export_fish(&pid, false);
+            cmd_export(&pid, false, shell);
         }
         "reload" => {
             let pid =
                 env::var("__DENV_PID").map_err(|_| "__DENV_PID not set (is the hook loaded?)")?;
-            cmd_export_fish(&pid, true);
+            let shell = env::var("__DENV_SHELL")
+                .ok()
+                .and_then(|s| Shell::from_str(&s))
+                .ok_or("__DENV_SHELL not set (is the hook loaded?)")?;
+            cmd_export(&pid, true, shell);
         }
         "hook" => {
-            if env::args().nth(2).as_deref() != Some("fish") {
-                return Err("usage: denv hook fish".to_string());
+            let shell_arg = env::args().nth(2);
+            match shell_arg.as_deref().and_then(Shell::from_str) {
+                Some(Shell::Fish) => print!("{FISH_HOOK}"),
+                Some(Shell::Bash) => print!("{BASH_HOOK}"),
+                Some(Shell::Zsh) => print!("{ZSH_HOOK}"),
+                None => return Err("usage: denv hook <fish|bash|zsh>".to_string()),
             }
-            print!("{FISH_HOOK}");
         }
         other => {
             return Err(format!("unknown command: {other}"));

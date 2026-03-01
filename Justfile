@@ -13,8 +13,6 @@ release:
 
 install: release
     cp target/{{ target }}/release/denv ~/.local/bin/
-    grep -qF 'denv hook fish' ~/.config/fish/config.fish \
-        || echo 'denv hook fish | source' >> ~/.config/fish/config.fish
 
 setup:
   prek install --install-hooks

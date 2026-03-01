@@ -1,12 +1,12 @@
-# denv — minimal direnv for fish
+# denv — minimal direnv
 
-Single-binary, zero-dependency direnv replacement. Fish shell only. Rust. macOS + Linux.
+Single-binary, zero-dependency direnv replacement. Fish, Bash, Zsh. Rust. macOS + Linux.
 
 ## Architecture
 
-One source file (`src/main.rs`, ~680 lines), one subprocess (bash for `.envrc`/`.env` eval).
+One source file (`src/main.rs`, ~780 lines), one subprocess (bash for `.envrc`/`.env` eval).
 
-Fish integration: `denv hook fish | source` in `config.fish`. The hook fires `denv export fish` on every `PWD` change.
+Shell integration: `denv hook <fish|bash|zsh>` prints the appropriate hook for each shell. Each hook sets `__DENV_SHELL` and `__DENV_PID`, then calls `denv export <shell>` on directory changes.
 
 ## Commands
 
@@ -14,9 +14,9 @@ Fish integration: `denv hook fish | source` in `config.fish`. The hook fires `de
 |---|---|
 | `denv allow` | Trust nearest `.envrc`, activate immediately |
 | `denv deny` | Revoke trust, unload immediately |
-| `denv export fish` | Hot path — emit `set -gx`/`set -e` to stdout |
+| `denv export <fish\|bash\|zsh>` | Hot path — emit shell-specific set/export/unset to stdout |
 | `denv reload` | Force re-evaluate (bypasses fast path) |
-| `denv hook fish` | Print the fish hook function |
+| `denv hook <fish\|bash\|zsh>` | Print the hook for the given shell |
 
 ## File discovery
 
@@ -61,7 +61,7 @@ Line 1: directory path. Line 2: space-separated mtimes (0 if file absent). Remai
 
 ## Prompt indicator variables
 
-denv sets two fish variables for prompt integration:
+denv sets two environment variables for prompt integration:
 
 | Variable | Meaning |
 |---|---|
@@ -70,7 +70,7 @@ denv sets two fish variables for prompt integration:
 
 Both are cleared when leaving a directory with no env files. `__DENV_DIRTY` is cleared on successful activation.
 
-Three prompt states:
+Three prompt states (fish example):
 ```fish
 if set -q __DENV_DIRTY
     # blocked, needs re-allow
@@ -79,9 +79,9 @@ else if set -q __DENV_DIR
 end
 ```
 
-These are regular fish variables set by `denv export fish | source` — zero cost to check at prompt time.
+Bash/zsh equivalent: check `[ -n "$__DENV_DIRTY" ]` / `[ -n "$__DENV_DIR" ]`.
 
-## `denv export fish` flow
+## `denv export <shell>` flow
 
 1. Find nearest dir with `.envrc` or `.env` (walk up parents)
 2. No env files found → restore previous values from active, clear state vars, done
@@ -91,7 +91,9 @@ These are regular fish variables set by `denv export fish | source` — zero cos
 6. Active exists → restore all previous values first (handles dir-switch and mtime-change)
 7. `.envrc` present + not allowed → set `__DENV_DIR` + `__DENV_DIRTY`, stderr warning, done
 8. Parse `.env` (if present) in Rust, eval `.envrc` (if present) via bash with `.env` entries appended as `export` statements
-9. Emit `set -gx` / `set -e`, set `__DENV_DIR`, `__DENV_STATE`, clear `__DENV_DIRTY`, save active
+9. Emit shell-appropriate set/export/unset commands, set `__DENV_DIR`, `__DENV_STATE`, clear `__DENV_DIRTY`, save active
+
+The `Shell` enum (`Fish`, `Bash`, `Zsh`) dispatches output syntax at each call site. Fish uses `set -gx`/`set -e`. Bash and Zsh share POSIX syntax (`export K='V'`/`unset K`).
 
 The `force` parameter (used by `reload`, `allow`, and `deny`) skips both fast paths.
 
@@ -99,7 +101,7 @@ On activation, a summary line is printed to stderr: `denv: +FOO +BAR`. On deacti
 
 ## `__DENV_STATE` fast path
 
-`__DENV_STATE` is a fish variable containing `{envrc_mtime} {dotenv_mtime} {dir}`. It's set on activation and cleared on leave/block. Since it lives in the shell's environment (inherited by child processes), denv can check it without any disk I/O — just `env::var()`.
+`__DENV_STATE` is an environment variable containing `{envrc_mtime} {dotenv_mtime} {dir}`. It's set on activation and cleared on leave/block. Since it lives in the shell's environment (inherited by child processes), denv can check it without any disk I/O — just `env::var()`.
 
 Fast path 2 (active file) is the fallback for the first `cd` after shell startup, before `__DENV_STATE` has been set by the hook. After that, the env var handles all subsequent checks.
 
@@ -147,29 +149,51 @@ Parse null-separated `KEY=VALUE` pairs into HashMaps, diff them. Filtered vars: 
 
 `.env` entries are injected after `.envrc` sourcing so they override. Values are bash single-quote escaped (`'` → `'\''`) to prevent injection.
 
-## Fish hook
+## Shell hooks
 
+Each shell hook sets `__DENV_PID` (shell PID for isolated state) and `__DENV_SHELL` (tells `allow`/`deny`/`reload` which syntax to emit), then triggers `denv export <shell>` on directory changes.
+
+**Fish** — triggers on `PWD` variable change:
 ```fish
 function __denv_export --on-variable PWD
     set -gx __DENV_PID %self
     denv export fish | source
 end
 function denv --wraps denv
-    set -gx __DENV_PID %self
-    switch "$argv[1]"
-        case allow deny reload
-            command denv $argv | source
-        case '*'
-            command denv $argv
-    end
+    ...
 end
 set -gx __DENV_PID %self
+set -gx __DENV_SHELL fish
 denv export fish | source
 ```
 
-`__DENV_PID` is fish's `%self` (shell PID), passed via env var so each shell gets isolated active state.
+**Bash** — uses `PROMPT_COMMAND`:
+```bash
+__denv_export() { eval "$(command denv export bash)"; }
+denv() {
+    case "$1" in
+        allow|deny|reload) eval "$(command denv "$@")" ;;
+        *) command denv "$@" ;;
+    esac
+}
+export __DENV_PID=$$
+export __DENV_SHELL=bash
+PROMPT_COMMAND="__denv_export${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+eval "$(command denv export bash)"
+```
 
-The `denv` wrapper function intercepts `allow`, `deny`, and `reload` — these commands emit fish `set` commands to stdout, so the wrapper sources their output directly. Other commands (`hook`, `export`) pass through unchanged. This means one subprocess per command, never two.
+**Zsh** — uses `precmd_functions` via `add-zsh-hook`:
+```zsh
+__denv_export() { eval "$(command denv export zsh)"; }
+denv() { ... }  # same wrapper as bash
+export __DENV_PID=$$
+export __DENV_SHELL=zsh
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd __denv_export
+eval "$(command denv export zsh)"
+```
+
+The `denv` wrapper function intercepts `allow`, `deny`, and `reload` — these commands emit shell commands to stdout, so the wrapper sources/evals their output directly. Other commands (`hook`, `export`) pass through unchanged.
 
 ## Key functions in `src/main.rs`
 
@@ -181,16 +205,17 @@ The `denv` wrapper function intercepts `allow`, `deny`, and `reload` — these c
 - `eval_env(dir, envrc, dotenv_entries, pid)` — bash subprocess with stdlib + `.envrc` + `.env` exports, returns `EnvDiff`
 - `bash_escape(value)` — single-quote escaping for bash export injection
 - `load_active(pid)` / `save_active(pid, state)` / `clear_active(pid)` — per-shell state
-- `emit_fish_restore(prev)` / `emit_fish_diff(diff)` — fish output
-- `print_diff_summary(diff)` / `print_unload_summary(prev)` — `+NAME`/`-NAME` to stderr
+- `Shell` enum — `Fish`, `Bash`, `Zsh`; dispatches output syntax
+- `write_shell_escaped(w, shell, value)` — single-quote escaping (fish: `\'`, bash/zsh: `'\''`)
+- `emit_export(w, shell, key, value)` / `emit_unset(w, shell, key)` — shell-specific set/unset
+- `emit_restore(prev, shell, out)` / `emit_diff(diff, shell, out)` — batch output
 - `parse_denv_state(s)` — parse `__DENV_STATE` env var into `(envrc_mtime, dotenv_mtime, dir)`
-- `cmd_export_fish(pid, force)` — main export logic with two-tier fast path
-- `fish_escape(value)` — single-quote escaping for fish
+- `cmd_export(pid, force, shell)` — main export logic with two-tier fast path
 - `escape_newlines` / `unescape_newlines` — active file serialization
 
 ## Testing
 
-Integration tests in `tests/integration.rs` (49 tests). Each test gets an isolated temp dir (project + data dir via `DENV_DATA_DIR`) and a unique fake PID. Tests run the compiled binary as a subprocess.
+Integration tests in `tests/integration.rs` (~63 tests). Each test gets an isolated temp dir (project + data dir via `DENV_DATA_DIR`) and a unique fake PID. Tests run the compiled binary as a subprocess. The test infra defaults `__DENV_SHELL=fish` so existing fish tests work unchanged.
 
 Run: `cargo test`
 
