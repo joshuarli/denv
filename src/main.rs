@@ -33,8 +33,8 @@ impl Shell {
 
 struct EnvFiles {
     dir: PathBuf,
-    envrc: Option<PathBuf>,
-    dotenv: Option<PathBuf>,
+    envrc: Option<(PathBuf, u64)>,
+    dotenv: Option<(PathBuf, u64)>,
 }
 
 fn find_env_files(start: &Path) -> Option<EnvFiles> {
@@ -42,13 +42,13 @@ fn find_env_files(start: &Path) -> Option<EnvFiles> {
     loop {
         let envrc = dir.join(".envrc");
         let dotenv = dir.join(".env");
-        let has_envrc = envrc.is_file();
-        let has_dotenv = dotenv.is_file();
-        if has_envrc || has_dotenv {
+        let envrc_meta = fs::metadata(&envrc).ok().filter(|m| m.is_file());
+        let dotenv_meta = fs::metadata(&dotenv).ok().filter(|m| m.is_file());
+        if envrc_meta.is_some() || dotenv_meta.is_some() {
             return Some(EnvFiles {
                 dir: dir.to_path_buf(),
-                envrc: if has_envrc { Some(envrc) } else { None },
-                dotenv: if has_dotenv { Some(dotenv) } else { None },
+                envrc: envrc_meta.map(|m| (envrc, m.mtime() as u64)),
+                dotenv: dotenv_meta.map(|m| (dotenv, m.mtime() as u64)),
             });
         }
         dir = dir.parent()?;
@@ -246,7 +246,7 @@ fn clear_active(pid: &str) {
 
 // --- .env parser ---
 
-fn parse_dotenv(content: &str) -> Vec<(&str, &str)> {
+fn parse_dotenv(content: &str) -> Vec<(&str, Cow<'_, str>)> {
     let mut entries = Vec::new();
     for line in content.lines() {
         let line = line.trim();
@@ -259,13 +259,37 @@ fn parse_dotenv(content: &str) -> Vec<(&str, &str)> {
         };
         let key = line[..eq].trim();
         let val = line[eq + 1..].trim();
-        // Strip matching outer quotes
-        let val = if (val.starts_with('"') && val.ends_with('"'))
-            || (val.starts_with('\'') && val.ends_with('\''))
-        {
-            &val[1..val.len() - 1]
+        let val: Cow<'_, str> = if val.starts_with('"') && val.ends_with('"') {
+            let inner = &val[1..val.len() - 1];
+            if inner.contains('\\') {
+                let mut out = String::with_capacity(inner.len());
+                let mut chars = inner.chars();
+                while let Some(c) = chars.next() {
+                    if c == '\\' {
+                        match chars.next() {
+                            Some('n') => out.push('\n'),
+                            Some('t') => out.push('\t'),
+                            Some('\\') => out.push('\\'),
+                            Some('"') => out.push('"'),
+                            Some('$') => out.push('$'),
+                            Some(other) => {
+                                out.push('\\');
+                                out.push(other);
+                            }
+                            None => out.push('\\'),
+                        }
+                    } else {
+                        out.push(c);
+                    }
+                }
+                Cow::Owned(out)
+            } else {
+                Cow::Borrowed(inner)
+            }
+        } else if val.starts_with('\'') && val.ends_with('\'') {
+            Cow::Borrowed(&val[1..val.len() - 1])
         } else {
-            val
+            Cow::Borrowed(val)
         };
         if !key.is_empty() {
             entries.push((key, val));
@@ -394,11 +418,13 @@ fn diff_sorted_env(before: &[(&str, &str)], after: &[(&str, &str)]) -> EnvDiff {
 fn eval_env(
     dir: &Path,
     envrc: Option<&Path>,
-    dotenv_entries: &[(&str, &str)],
+    dotenv_entries: &[(&str, Cow<'_, str>)],
     pid: &str,
 ) -> Result<EnvDiff, String> {
-    let before_path = format!("/tmp/denv_before_{pid}");
-    let after_path = format!("/tmp/denv_after_{pid}");
+    let data = data_dir();
+    fs::create_dir_all(&data).map_err(|e| format!("create data dir: {e}"))?;
+    let before_path = format!("{}/before_{pid}", data.display());
+    let after_path = format!("{}/after_{pid}", data.display());
 
     let mut script = String::with_capacity(DIRENV_STDLIB.len() + 256);
     script.push_str(DIRENV_STDLIB);
@@ -576,17 +602,9 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) {
         return;
     };
 
-    // Cheap mtime checks before any canonicalize or disk reads
-    let envrc_mtime = found
-        .envrc
-        .as_ref()
-        .and_then(|p| mtime_of(p).ok())
-        .unwrap_or(0);
-    let dotenv_mtime = found
-        .dotenv
-        .as_ref()
-        .and_then(|p| mtime_of(p).ok())
-        .unwrap_or(0);
+    // Mtimes already captured by find_env_files — zero additional stats
+    let envrc_mtime = found.envrc.as_ref().map(|(_, m)| *m).unwrap_or(0);
+    let dotenv_mtime = found.dotenv.as_ref().map(|(_, m)| *m).unwrap_or(0);
 
     // Fast path 1: env var check — zero disk reads
     if !force
@@ -622,7 +640,7 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) {
     let envrc = found
         .envrc
         .as_ref()
-        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+        .map(|(p, _)| p.canonicalize().unwrap_or_else(|_| p.clone()));
 
     // Restore previous state before loading new
     if let Some(ref state) = active {
@@ -654,7 +672,7 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) {
 
     // Parse .env entries (use found.dotenv directly — no canonicalize needed)
     let dotenv_content = match &found.dotenv {
-        Some(p) => match fs::read_to_string(p) {
+        Some((p, _)) => match fs::read_to_string(p) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("denv: read .env: {e}");
@@ -777,9 +795,11 @@ fn run() -> Result<(), String> {
 
     match cmd {
         "allow" | "deny" => {
-            let cwd = env::current_dir().map_err(|e| format!("cannot get cwd: {e}"))?;
+            let cwd = env::var_os("PWD")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| env::current_dir().expect("cannot get cwd"));
             let found = find_env_files(&cwd).ok_or("no .envrc or .env found")?;
-            let envrc = found.envrc.ok_or("no .envrc found")?;
+            let (envrc, _) = found.envrc.ok_or("no .envrc found")?;
             let envrc = envrc.canonicalize().unwrap_or(envrc);
             if cmd == "allow" {
                 cmd_allow(&envrc)

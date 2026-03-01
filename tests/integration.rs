@@ -86,8 +86,6 @@ impl Drop for TestEnv {
         if let Some(base) = self.proj.parent() {
             let _ = fs::remove_dir_all(base);
         }
-        let _ = fs::remove_file(format!("/tmp/denv_before_{}", self.pid));
-        let _ = fs::remove_file(format!("/tmp/denv_after_{}", self.pid));
     }
 }
 
@@ -488,6 +486,78 @@ fn dotenv_with_quoted_values() {
     let r = t.denv(&["export", "fish"]);
     assert!(r.stdout.contains("set -gx DOUBLE 'hello world';"));
     assert!(r.stdout.contains("set -gx SINGLE 'foo bar';"));
+}
+
+#[test]
+fn dotenv_escape_newline() {
+    let t = TestEnv::new();
+    t.write_dotenv(r#"MSG="hello\nworld""#);
+
+    let r = t.denv(&["export", "fish"]);
+    assert!(r.success);
+    // Value should contain actual newline, not literal \n
+    assert!(
+        r.stdout.contains("set -gx MSG 'hello\nworld';"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn dotenv_escape_tab() {
+    let t = TestEnv::new();
+    t.write_dotenv(r#"MSG="col1\tcol2""#);
+
+    let r = t.denv(&["export", "fish"]);
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("set -gx MSG 'col1\tcol2';"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn dotenv_escape_backslash() {
+    let t = TestEnv::new();
+    t.write_dotenv(r#"MSG="path\\to\\file""#);
+
+    let r = t.denv(&["export", "fish"]);
+    assert!(r.success);
+    assert!(
+        r.stdout.contains(r"set -gx MSG 'path\to\file';"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn dotenv_escape_quote() {
+    let t = TestEnv::new();
+    t.write_dotenv(r#"MSG="say \"hi\"""#);
+
+    let r = t.denv(&["export", "fish"]);
+    assert!(r.success);
+    assert!(
+        r.stdout.contains(r#"set -gx MSG 'say "hi"';"#),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn dotenv_single_quote_no_escape() {
+    let t = TestEnv::new();
+    t.write_dotenv(r"MSG='hello\nworld'");
+
+    let r = t.denv(&["export", "fish"]);
+    assert!(r.success);
+    // Single-quoted: no escape processing, literal \n
+    assert!(
+        r.stdout.contains(r"set -gx MSG 'hello\nworld';"),
+        "stdout: {}",
+        r.stdout
+    );
 }
 
 #[test]
