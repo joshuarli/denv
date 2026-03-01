@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::os::fd::AsFd;
 use std::process::Command;
 
 // --- Find env files ---
@@ -36,24 +38,24 @@ fn find_env_files(start: &Path) -> Option<EnvFiles> {
 // --- Trust ---
 
 fn trust_key(path: &Path) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let bytes = path.as_os_str().as_encoded_bytes();
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
-        use std::fmt::Write;
-        write!(s, "{b:02x}").unwrap();
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
     }
     s
 }
 
 fn data_dir() -> PathBuf {
-    if let Ok(d) = env::var("DENV_DATA_DIR") {
+    if let Some(d) = env::var_os("DENV_DATA_DIR") {
         return PathBuf::from(d);
     }
-    if let Ok(d) = env::var("XDG_DATA_HOME") {
+    if let Some(d) = env::var_os("XDG_DATA_HOME") {
         return PathBuf::from(d).join("denv");
     }
-    let home = env::var("HOME").expect("HOME not set");
-    PathBuf::from(home).join(".local/share/denv")
+    PathBuf::from(env::var_os("HOME").expect("HOME not set")).join(".local/share/denv")
 }
 
 fn allow_dir() -> PathBuf {
@@ -75,7 +77,7 @@ fn is_allowed(envrc: &Path) -> bool {
         Ok(m) => m,
         Err(_) => return false,
     };
-    stored.trim() == current.to_string()
+    stored.trim().parse::<u64>() == Ok(current)
 }
 
 fn cmd_allow(envrc: &Path) {
@@ -113,19 +115,36 @@ enum PrevVar {
     Unset(String),
 }
 
-fn escape_newlines(s: &str) -> String {
+fn escape_newlines(s: &str) -> Cow<'_, str> {
+    if !s.as_bytes().iter().any(|&b| b == b'\\' || b == b'\n') {
+        return Cow::Borrowed(s);
+    }
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            _ => out.push(c),
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                out.push_str(&s[start..i]);
+                out.push_str("\\\\");
+                start = i + 1;
+            }
+            b'\n' => {
+                out.push_str(&s[start..i]);
+                out.push_str("\\n");
+                start = i + 1;
+            }
+            _ => {}
         }
     }
-    out
+    out.push_str(&s[start..]);
+    Cow::Owned(out)
 }
 
-fn unescape_newlines(s: &str) -> String {
+fn unescape_newlines(s: &str) -> Cow<'_, str> {
+    if !s.contains('\\') {
+        return Cow::Borrowed(s);
+    }
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -143,7 +162,7 @@ fn unescape_newlines(s: &str) -> String {
             out.push(c);
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 fn active_path(pid: &str) -> PathBuf {
@@ -163,7 +182,7 @@ fn load_active(pid: &str) -> Option<ActiveState> {
         if let Some(eq) = line.find('=') {
             let key = &line[..eq];
             let val = unescape_newlines(&line[eq + 1..]);
-            prev.push(PrevVar::Restore(key.to_string(), val));
+            prev.push(PrevVar::Restore(key.to_string(), val.into_owned()));
         } else if !line.is_empty() {
             prev.push(PrevVar::Unset(line.to_string()));
         }
@@ -182,9 +201,7 @@ fn save_active(pid: &str, state: &ActiveState) {
     let mut buf = String::new();
     buf.push_str(&state.dir.to_string_lossy());
     buf.push('\n');
-    buf.push_str(&state.envrc_mtime.to_string());
-    buf.push(' ');
-    buf.push_str(&state.dotenv_mtime.to_string());
+    write!(buf, "{} {}", state.envrc_mtime, state.dotenv_mtime).unwrap();
     buf.push('\n');
     for pv in &state.prev {
         match pv {
@@ -209,8 +226,7 @@ fn clear_active(pid: &str) {
 
 // --- .env parser ---
 
-fn parse_dotenv(path: &Path) -> Result<Vec<(String, String)>, String> {
-    let content = fs::read_to_string(path).map_err(|e| format!("read .env: {e}"))?;
+fn parse_dotenv(content: &str) -> Vec<(&str, &str)> {
     let mut entries = Vec::new();
     for line in content.lines() {
         let line = line.trim();
@@ -232,45 +248,50 @@ fn parse_dotenv(path: &Path) -> Result<Vec<(String, String)>, String> {
             val
         };
         if !key.is_empty() {
-            entries.push((key.to_string(), val.to_string()));
+            entries.push((key, val));
         }
     }
-    Ok(entries)
+    entries
 }
 
 // --- Bash eval ---
 
-const FILTERED_VARS: &[&str] = &["_", "SHLVL", "PWD", "OLDPWD", "BASH_EXECUTION_STRING"];
-
-fn parse_env_null(data: &[u8]) -> HashMap<String, String> {
-    let mut map = HashMap::new();
+fn parse_env_null(data: &[u8]) -> Vec<(&str, &str)> {
+    let mut entries = Vec::new();
     for entry in data.split(|&b| b == 0) {
         if entry.is_empty() {
             continue;
         }
-        let s = String::from_utf8_lossy(entry);
+        let Ok(s) = std::str::from_utf8(entry) else {
+            continue;
+        };
         if let Some(eq) = s.find('=') {
             let key = &s[..eq];
-            if !FILTERED_VARS.contains(&key) {
-                map.insert(key.to_string(), s[eq + 1..].to_string());
+            if !matches!(
+                key,
+                "_" | "SHLVL" | "PWD" | "OLDPWD" | "BASH_EXECUTION_STRING"
+            ) {
+                entries.push((key, &s[eq + 1..]));
             }
         }
     }
-    map
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    entries
 }
 
-fn bash_escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
+fn push_bash_escaped(out: &mut String, value: &str) {
     out.push('\'');
-    for c in value.chars() {
-        if c == '\'' {
+    let bytes = value.as_bytes();
+    let mut start = 0;
+    for i in 0..bytes.len() {
+        if bytes[i] == b'\'' {
+            out.push_str(&value[start..i]);
             out.push_str("'\\''");
-        } else {
-            out.push(c);
+            start = i + 1;
         }
     }
+    out.push_str(&value[start..]);
     out.push('\'');
-    out
 }
 
 struct EnvDiff {
@@ -318,25 +339,59 @@ strict_env() { set -euo pipefail; }
 unstrict_env() { set +euo pipefail; }
 "#;
 
+fn diff_sorted_env(before: &[(&str, &str)], after: &[(&str, &str)]) -> EnvDiff {
+    let (mut bi, mut ai) = (0, 0);
+    let mut set = Vec::new();
+    let mut unset = Vec::new();
+    while bi < before.len() && ai < after.len() {
+        match before[bi].0.cmp(after[ai].0) {
+            Ordering::Less => {
+                unset.push(before[bi].0.to_owned());
+                bi += 1;
+            }
+            Ordering::Greater => {
+                set.push((after[ai].0.to_owned(), after[ai].1.to_owned()));
+                ai += 1;
+            }
+            Ordering::Equal => {
+                if before[bi].1 != after[ai].1 {
+                    set.push((after[ai].0.to_owned(), after[ai].1.to_owned()));
+                }
+                bi += 1;
+                ai += 1;
+            }
+        }
+    }
+    for b in &before[bi..] {
+        unset.push(b.0.to_owned());
+    }
+    for a in &after[ai..] {
+        set.push((a.0.to_owned(), a.1.to_owned()));
+    }
+    EnvDiff { set, unset }
+}
+
 fn eval_env(
     dir: &Path,
     envrc: Option<&Path>,
-    dotenv_entries: &[(String, String)],
+    dotenv_entries: &[(&str, &str)],
     pid: &str,
 ) -> Result<EnvDiff, String> {
     let before_path = format!("/tmp/denv_before_{pid}");
     let after_path = format!("/tmp/denv_after_{pid}");
 
-    let mut script = String::new();
+    let mut script = String::with_capacity(DIRENV_STDLIB.len() + 256);
     script.push_str(DIRENV_STDLIB);
-    script.push_str(&format!("env -0 > '{}'\n", before_path));
+    writeln!(script, "env -0 > '{}'", before_path).unwrap();
     if let Some(envrc) = envrc {
-        script.push_str(&format!(". '{}'\n", envrc.display()));
+        writeln!(script, ". '{}'", envrc.display()).unwrap();
     }
     for (k, v) in dotenv_entries {
-        script.push_str(&format!("export {}={}\n", k, bash_escape(v)));
+        write!(script, "export {}=", k).unwrap();
+        push_bash_escaped(&mut script, v);
+        script.push('\n');
     }
-    script.push_str(&format!("env -0 > '{}'", after_path));
+    write!(script, "env -0 > '{}'", after_path).unwrap();
 
     // Dup stderr as bash's stdout so .envrc output streams to terminal.
     // Our stdout may be a pipe (fish sources it), so we can't inherit it.
@@ -370,47 +425,33 @@ fn eval_env(
     let before = parse_env_null(&before_data);
     let after = parse_env_null(&after_data);
 
-    let mut set = Vec::new();
-    let mut unset = Vec::new();
-
-    for (k, v) in &after {
-        match before.get(k) {
-            Some(old) if old == v => {}
-            _ => set.push((k.clone(), v.clone())),
-        }
-    }
-    for k in before.keys() {
-        if !after.contains_key(k) {
-            unset.push(k.clone());
-        }
-    }
-
-    set.sort_by(|a, b| a.0.cmp(&b.0));
-    unset.sort();
-
-    Ok(EnvDiff { set, unset })
+    Ok(diff_sorted_env(&before, &after))
 }
 
 // --- Fish output ---
 
-fn fish_escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('\'');
-    for c in value.chars() {
-        if c == '\'' {
-            out.push('\\');
+fn write_fish_escaped(w: &mut impl Write, value: &str) {
+    let _ = w.write_all(b"'");
+    let bytes = value.as_bytes();
+    let mut start = 0;
+    for i in 0..bytes.len() {
+        if bytes[i] == b'\'' {
+            let _ = w.write_all(&bytes[start..i]);
+            let _ = w.write_all(b"\\'");
+            start = i + 1;
         }
-        out.push(c);
     }
-    out.push('\'');
-    out
+    let _ = w.write_all(&bytes[start..]);
+    let _ = w.write_all(b"'");
 }
 
 fn emit_fish_restore(prev: &[PrevVar], stdout: &mut impl Write) {
     for pv in prev {
         match pv {
             PrevVar::Restore(k, v) => {
-                writeln!(stdout, "set -gx {} {};", k, fish_escape(v)).unwrap();
+                let _ = write!(stdout, "set -gx {} ", k);
+                write_fish_escaped(stdout, v);
+                let _ = writeln!(stdout, ";");
             }
             PrevVar::Unset(k) => {
                 writeln!(stdout, "set -e {};", k).unwrap();
@@ -421,7 +462,9 @@ fn emit_fish_restore(prev: &[PrevVar], stdout: &mut impl Write) {
 
 fn emit_fish_diff(diff: &EnvDiff, stdout: &mut impl Write) {
     for (k, v) in &diff.set {
-        writeln!(stdout, "set -gx {} {};", k, fish_escape(v)).unwrap();
+        let _ = write!(stdout, "set -gx {} ", k);
+        write_fish_escaped(stdout, v);
+        let _ = writeln!(stdout, ";");
     }
     for k in &diff.unset {
         writeln!(stdout, "set -e {};", k).unwrap();
@@ -430,35 +473,23 @@ fn emit_fish_diff(diff: &EnvDiff, stdout: &mut impl Write) {
 
 // --- Summary ---
 
-fn print_diff_summary(diff: &EnvDiff) {
-    let mut parts: Vec<String> = Vec::new();
-    for (k, _) in &diff.set {
-        if !k.starts_with("__DENV_") {
-            parts.push(format!("+{k}"));
+fn print_summary<'a>(items: impl Iterator<Item = (char, &'a str)>) {
+    let stderr = io::stderr();
+    let mut err = stderr.lock();
+    let mut first = true;
+    for (sign, k) in items {
+        if k.starts_with("__DENV_") {
+            continue;
+        }
+        if first {
+            let _ = write!(err, "denv: {sign}{k}");
+            first = false;
+        } else {
+            let _ = write!(err, " {sign}{k}");
         }
     }
-    for k in &diff.unset {
-        if !k.starts_with("__DENV_") {
-            parts.push(format!("-{k}"));
-        }
-    }
-    if !parts.is_empty() {
-        eprintln!("denv: {}", parts.join(" "));
-    }
-}
-
-fn print_unload_summary(prev: &[PrevVar]) {
-    let mut parts: Vec<String> = Vec::new();
-    for pv in prev {
-        let k = match pv {
-            PrevVar::Restore(k, _) | PrevVar::Unset(k) => k,
-        };
-        if !k.starts_with("__DENV_") {
-            parts.push(format!("-{k}"));
-        }
-    }
-    if !parts.is_empty() {
-        eprintln!("denv: {}", parts.join(" "));
+    if !first {
+        let _ = writeln!(err);
     }
 }
 
@@ -481,11 +512,15 @@ fn cmd_export_fish(pid: &str, force: bool) {
         // No .envrc or .env found — restore if we had active state
         if let Some(state) = load_active(pid) {
             emit_fish_restore(&state.prev, &mut out);
-            writeln!(out, "set -e __DENV_DIR;").unwrap();
-            writeln!(out, "set -e __DENV_DIRTY;").unwrap();
-            writeln!(out, "set -e __DENV_STATE;").unwrap();
+            out.write_all(b"set -e __DENV_DIR;\nset -e __DENV_DIRTY;\nset -e __DENV_STATE;\n")
+                .unwrap();
             clear_active(pid);
-            print_unload_summary(&state.prev);
+            print_summary(state.prev.iter().map(|pv| {
+                let k = match pv {
+                    PrevVar::Restore(k, _) | PrevVar::Unset(k) => k.as_str(),
+                };
+                ('-', k)
+            }));
         }
         return;
     };
@@ -503,35 +538,30 @@ fn cmd_export_fish(pid: &str, force: bool) {
         .unwrap_or(0);
 
     // Fast path 1: env var check — zero disk reads
-    if !force {
-        if let Ok(state_str) = env::var("__DENV_STATE") {
-            if let Some((st_envrc, st_dotenv, st_dir)) = parse_denv_state(&state_str) {
-                if st_envrc == envrc_mtime
-                    && st_dotenv == dotenv_mtime
-                    && (st_dir == found.dir.to_string_lossy().as_ref()
-                        || found
-                            .dir
-                            .canonicalize()
-                            .map_or(false, |c| st_dir == c.to_string_lossy().as_ref()))
-                {
-                    return;
-                }
-            }
-        }
+    if !force
+        && let Ok(state_str) = env::var("__DENV_STATE")
+        && let Some((st_envrc, st_dotenv, st_dir)) = parse_denv_state(&state_str)
+        && st_envrc == envrc_mtime
+        && st_dotenv == dotenv_mtime
+        && (st_dir == found.dir.to_string_lossy().as_ref()
+            || found
+                .dir
+                .canonicalize()
+                .is_ok_and(|c| st_dir == c.to_string_lossy().as_ref()))
+    {
+        return;
     }
 
     // Fast path 2: active file check — one disk read (fallback when env var not set)
     let active = load_active(pid);
-    if !force {
-        if let Some(ref state) = active {
-            if state.envrc_mtime == envrc_mtime
-                && state.dotenv_mtime == dotenv_mtime
-                && (state.dir == found.dir
-                    || state.dir == found.dir.canonicalize().unwrap_or_default())
-            {
-                return;
-            }
-        }
+    if !force
+        && let Some(ref state) = active
+        && state.envrc_mtime == envrc_mtime
+        && state.dotenv_mtime == dotenv_mtime
+        && (state.dir == found.dir
+            || state.dir == found.dir.canonicalize().unwrap_or_default())
+    {
+        return;
     }
 
     let dir = found
@@ -542,10 +572,6 @@ fn cmd_export_fish(pid: &str, force: bool) {
         .envrc
         .as_ref()
         .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
-    let dotenv = found
-        .dotenv
-        .as_ref()
-        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
 
     // Restore previous state before loading new
     if let Some(ref state) = active {
@@ -553,39 +579,42 @@ fn cmd_export_fish(pid: &str, force: bool) {
     }
 
     // .envrc requires trust; .env alone does not
-    if let Some(ref envrc_path) = envrc {
-        if !is_allowed(envrc_path) {
-            eprintln!(
-                "denv: {} is blocked. Run `denv allow` to trust it.",
-                envrc_path.display()
-            );
-            writeln!(
-                out,
-                "set -gx __DENV_DIR {};",
-                fish_escape(&dir.to_string_lossy())
-            )
-            .unwrap();
-            writeln!(out, "set -gx __DENV_DIRTY 1;").unwrap();
-            writeln!(out, "set -e __DENV_STATE;").unwrap();
-            if let Some(ref state) = active {
-                print_unload_summary(&state.prev);
-            }
-            clear_active(pid);
-            return;
+    if let Some(ref envrc_path) = envrc
+        && !is_allowed(envrc_path)
+    {
+        eprintln!(
+            "denv: {} is blocked. Run `denv allow` to trust it.",
+            envrc_path.display()
+        );
+        write!(out, "set -gx __DENV_DIR ").unwrap();
+        write_fish_escaped(&mut out, &dir.to_string_lossy());
+        writeln!(out, ";").unwrap();
+        writeln!(out, "set -gx __DENV_DIRTY 1;").unwrap();
+        writeln!(out, "set -e __DENV_STATE;").unwrap();
+        if let Some(ref state) = active {
+            print_summary(state.prev.iter().map(|pv| {
+                let k = match pv {
+                    PrevVar::Restore(k, _) | PrevVar::Unset(k) => k.as_str(),
+                };
+                ('-', k)
+            }));
         }
+        clear_active(pid);
+        return;
     }
 
-    // Parse .env entries
-    let dotenv_entries = match &dotenv {
-        Some(p) => match parse_dotenv(p) {
-            Ok(e) => e,
+    // Parse .env entries (use found.dotenv directly — no canonicalize needed)
+    let dotenv_content = match &found.dotenv {
+        Some(p) => match fs::read_to_string(p) {
+            Ok(c) => c,
             Err(e) => {
-                eprintln!("denv: {e}");
+                eprintln!("denv: read .env: {e}");
                 return;
             }
         },
-        None => Vec::new(),
+        None => String::new(),
     };
+    let dotenv_entries = parse_dotenv(&dotenv_content);
 
     // Eval: .envrc (if present) then .env entries layered on top
     let diff = match eval_env(&dir, envrc.as_deref(), &dotenv_entries, pid) {
@@ -611,16 +640,19 @@ fn cmd_export_fish(pid: &str, force: bool) {
     }
 
     emit_fish_diff(&diff, &mut out);
-    writeln!(
-        out,
-        "set -gx __DENV_DIR {};",
-        fish_escape(&dir.to_string_lossy())
-    )
-    .unwrap();
+    write!(out, "set -gx __DENV_DIR ").unwrap();
+    write_fish_escaped(&mut out, &dir.to_string_lossy());
+    writeln!(out, ";").unwrap();
     writeln!(out, "set -e __DENV_DIRTY;").unwrap();
-    let state_val = format!("{} {} {}", envrc_mtime, dotenv_mtime, dir.display());
-    writeln!(out, "set -gx __DENV_STATE {};", fish_escape(&state_val)).unwrap();
-    print_diff_summary(&diff);
+    out.write_all(b"set -gx __DENV_STATE '").unwrap();
+    write!(out, "{} {} {}", envrc_mtime, dotenv_mtime, dir.display()).unwrap();
+    out.write_all(b"';\n").unwrap();
+    print_summary(
+        diff.set
+            .iter()
+            .map(|(k, _)| ('+', k.as_str()))
+            .chain(diff.unset.iter().map(|k| ('-', k.as_str()))),
+    );
     save_active(
         pid,
         &ActiveState {
@@ -654,38 +686,29 @@ denv export fish | source
 // --- Main ---
 
 fn run() -> Result<(), String> {
-    let args: Vec<String> = env::args().collect();
-
-    if args.len() < 2 {
+    let cmd = env::args().nth(1);
+    let Some(cmd) = cmd.as_deref() else {
         eprintln!("usage: denv <allow|deny|export fish|reload|hook fish>");
         std::process::exit(1);
-    }
+    };
 
-    match args[1].as_str() {
-        "allow" => {
-            let cwd = env::current_dir().map_err(|e| format!("cannot get cwd: {e}"))?;
-            let found = find_env_files(&cwd).ok_or("no .envrc or .env found")?;
-            let envrc = found
-                .envrc
-                .ok_or("no .envrc found (only .env files need no approval)")?;
-            let envrc = envrc.canonicalize().unwrap_or(envrc);
-            cmd_allow(&envrc);
-            if let Ok(pid) = env::var("__DENV_PID") {
-                cmd_export_fish(&pid, true);
-            }
-        }
-        "deny" => {
+    match cmd {
+        "allow" | "deny" => {
             let cwd = env::current_dir().map_err(|e| format!("cannot get cwd: {e}"))?;
             let found = find_env_files(&cwd).ok_or("no .envrc or .env found")?;
             let envrc = found.envrc.ok_or("no .envrc found")?;
             let envrc = envrc.canonicalize().unwrap_or(envrc);
-            cmd_deny(&envrc);
+            if cmd == "allow" {
+                cmd_allow(&envrc)
+            } else {
+                cmd_deny(&envrc)
+            }
             if let Ok(pid) = env::var("__DENV_PID") {
                 cmd_export_fish(&pid, true);
             }
         }
         "export" => {
-            if args.get(2).map(|s| s.as_str()) != Some("fish") {
+            if env::args().nth(2).as_deref() != Some("fish") {
                 return Err("usage: denv export fish".to_string());
             }
             let pid =
@@ -698,7 +721,7 @@ fn run() -> Result<(), String> {
             cmd_export_fish(&pid, true);
         }
         "hook" => {
-            if args.get(2).map(|s| s.as_str()) != Some("fish") {
+            if env::args().nth(2).as_deref() != Some("fish") {
                 return Err("usage: denv hook fish".to_string());
             }
             print!("{FISH_HOOK}");

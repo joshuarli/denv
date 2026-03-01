@@ -258,7 +258,10 @@ fn hook_fish_output() {
     let t = TestEnv::new();
     let r = t.denv(&["hook", "fish"]);
     assert!(r.success);
-    assert!(r.stdout.contains("function __denv_export --on-variable PWD"));
+    assert!(
+        r.stdout
+            .contains("function __denv_export --on-variable PWD")
+    );
     assert!(r.stdout.contains("function denv --wraps denv"));
     assert!(r.stdout.contains("command denv $argv | source"));
     assert!(r.stdout.contains("denv export fish | source"));
@@ -527,11 +530,7 @@ fn compat_path_add_absolute() {
     t.write_envrc("PATH_add /custom/bin");
 
     let r = t.allow();
-    assert!(
-        r.stdout.contains("/custom/bin"),
-        "stdout: {}",
-        r.stdout
-    );
+    assert!(r.stdout.contains("/custom/bin"), "stdout: {}", r.stdout);
 }
 
 #[test]
@@ -637,13 +636,17 @@ fn state_var_fast_path_skips_disk_read() {
 
     let r = t.allow();
     // Extract __DENV_STATE value from output
-    let state_line = r.stdout.lines()
+    let state_line = r
+        .stdout
+        .lines()
         .find(|l| l.contains("__DENV_STATE"))
         .expect("should emit __DENV_STATE");
     // Parse: "set -gx __DENV_STATE 'value';"
     let val = state_line
-        .strip_prefix("set -gx __DENV_STATE '").unwrap()
-        .strip_suffix("';").unwrap();
+        .strip_prefix("set -gx __DENV_STATE '")
+        .unwrap()
+        .strip_suffix("';")
+        .unwrap();
 
     // Delete the active file — env var fast path should still work
     let active_file = t.data.join(format!("active_{}", t.pid));
@@ -678,12 +681,16 @@ fn state_var_fast_path_detects_mtime_change() {
     t.write_envrc("export FOO=bar");
 
     let r = t.allow();
-    let state_line = r.stdout.lines()
+    let state_line = r
+        .stdout
+        .lines()
         .find(|l| l.contains("__DENV_STATE"))
         .unwrap();
     let val = state_line
-        .strip_prefix("set -gx __DENV_STATE '").unwrap()
-        .strip_suffix("';").unwrap();
+        .strip_prefix("set -gx __DENV_STATE '")
+        .unwrap()
+        .strip_suffix("';")
+        .unwrap();
 
     // Edit envrc — mtime changes
     std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -692,5 +699,9 @@ fn state_var_fast_path_detects_mtime_change() {
 
     // Old __DENV_STATE has stale mtime — should NOT fast path
     let r = t.denv_in_env(&t.proj, &["reload"], &[("__DENV_STATE", val)]);
-    assert!(r.stdout.contains("set -gx FOO 'changed';"), "stdout: {}", r.stdout);
+    assert!(
+        r.stdout.contains("set -gx FOO 'changed';"),
+        "stdout: {}",
+        r.stdout
+    );
 }
