@@ -992,6 +992,55 @@ fn reload_uses_denv_shell() {
 }
 
 #[test]
+fn dotenv_only_no_subprocess() {
+    let t = TestEnv::new();
+    t.write_dotenv("FOO=bar\nBAZ=qux");
+
+    let r = t.denv(&["export", "fish"]);
+    assert!(r.success);
+    assert!(r.stdout.contains("set -gx FOO 'bar';"));
+    assert!(r.stdout.contains("set -gx BAZ 'qux';"));
+    // No bash subprocess was spawned, so BASH_EXECUTION_STRING should not appear
+    assert!(
+        !r.stdout.contains("BASH_EXECUTION_STRING"),
+        "stdout should not leak bash internals: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn dotenv_only_skips_unchanged() {
+    let t = TestEnv::new();
+    t.write_dotenv("FOO=bar");
+
+    // Pre-set FOO=bar in the environment so the diff sees no change
+    let r = t.denv_in_env(&t.proj, &["export", "fish"], &[("FOO", "bar")]);
+    assert!(r.success);
+    // FOO should not be re-exported since it already matches
+    assert!(
+        !r.stdout.contains("set -gx FOO"),
+        "should skip unchanged var: {}",
+        r.stdout
+    );
+    // __DENV_DIR and __DENV_STATE should still be set
+    assert!(r.stdout.contains("__DENV_DIR"));
+    assert!(r.stdout.contains("__DENV_STATE"));
+}
+
+#[test]
+fn dotenv_only_with_envrc_still_uses_bash() {
+    let t = TestEnv::new();
+    t.write_envrc("export FROM_ENVRC=1");
+    t.write_dotenv("FROM_DOTENV=1");
+
+    let r = t.allow();
+    assert!(r.success);
+    // Both sources should contribute
+    assert!(r.stdout.contains("FROM_ENVRC"));
+    assert!(r.stdout.contains("FROM_DOTENV"));
+}
+
+#[test]
 fn export_requires_valid_shell() {
     let t = TestEnv::new();
     let r = t.denv(&["export", "powershell"]);

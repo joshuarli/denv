@@ -38,20 +38,28 @@ struct EnvFiles {
 }
 
 fn find_env_files(start: &Path) -> Option<EnvFiles> {
-    let mut dir = start;
+    let mut buf = start.to_path_buf();
     loop {
-        let envrc = dir.join(".envrc");
-        let dotenv = dir.join(".env");
-        let envrc_meta = fs::metadata(&envrc).ok().filter(|m| m.is_file());
-        let dotenv_meta = fs::metadata(&dotenv).ok().filter(|m| m.is_file());
+        buf.push(".envrc");
+        let envrc_meta = fs::metadata(&buf).ok().filter(|m| m.is_file());
+        let envrc = envrc_meta.as_ref().map(|_| buf.clone());
+        buf.pop();
+
+        buf.push(".env");
+        let dotenv_meta = fs::metadata(&buf).ok().filter(|m| m.is_file());
+        let dotenv = dotenv_meta.as_ref().map(|_| buf.clone());
+        buf.pop();
+
         if envrc_meta.is_some() || dotenv_meta.is_some() {
             return Some(EnvFiles {
-                dir: dir.to_path_buf(),
-                envrc: envrc_meta.map(|m| (envrc, m.mtime() as u64)),
-                dotenv: dotenv_meta.map(|m| (dotenv, m.mtime() as u64)),
+                dir: buf,
+                envrc: envrc_meta.map(|m| (envrc.unwrap(), m.mtime() as u64)),
+                dotenv: dotenv_meta.map(|m| (dotenv.unwrap(), m.mtime() as u64)),
             });
         }
-        dir = dir.parent()?;
+        if !buf.pop() {
+            return None;
+        }
     }
 }
 
@@ -684,11 +692,22 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) {
     let dotenv_entries = parse_dotenv(&dotenv_content);
 
     // Eval: .envrc (if present) then .env entries layered on top
-    let diff = match eval_env(&dir, envrc.as_deref(), &dotenv_entries, pid) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("denv: {e}");
-            return;
+    let diff = if envrc.is_none() {
+        // .env-only: diff directly against current env — no subprocess
+        let mut set = Vec::new();
+        for (k, v) in &dotenv_entries {
+            if !env::var(k).is_ok_and(|cur| cur == v.as_ref()) {
+                set.push((k.to_string(), v.to_string()));
+            }
+        }
+        EnvDiff { set, unset: Vec::new() }
+    } else {
+        match eval_env(&dir, envrc.as_deref(), &dotenv_entries, pid) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("denv: {e}");
+                return;
+            }
         }
     };
 
