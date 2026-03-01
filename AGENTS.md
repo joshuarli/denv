@@ -131,11 +131,13 @@ unstrict_env()          # set +euo pipefail
 
 The bash subprocess runs with `current_dir` set to the `.envrc`'s directory, so relative paths in `PATH_add` resolve correctly.
 
+Both stdout and stderr of the bash subprocess are duped from denv's stderr (the terminal), so `.envrc` output streams in real time. denv's own stdout is reserved for fish commands (`set -gx`/`set -e`), which the fish wrapper sources. The `env -0 > file` commands use explicit file redirects, unaffected by fd 1.
+
 Full eval flow:
 ```bash
 # {DIRENV_STDLIB functions}
 env -0 > /tmp/denv_before_{pid}
-. /path/to/.envrc          # if .envrc exists
+. /path/to/.envrc          # if .envrc exists; output streams to terminal
 export KEY1='val1'         # .env entries, bash-escaped
 export KEY2='val2'
 env -0 > /tmp/denv_after_{pid}
@@ -144,8 +146,6 @@ env -0 > /tmp/denv_after_{pid}
 Parse null-separated `KEY=VALUE` pairs into HashMaps, diff them. Filtered vars: `_`, `SHLVL`, `PWD`, `OLDPWD`, `BASH_EXECUTION_STRING`.
 
 `.env` entries are injected after `.envrc` sourcing so they override. Values are bash single-quote escaped (`'` → `'\''`) to prevent injection.
-
-Error reporting shows stdout when stderr is empty (handles scripts that do `exec 2>&1`).
 
 ## Fish hook
 

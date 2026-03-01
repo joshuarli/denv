@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::os::fd::AsFd;
 use std::process::Command;
 
 // --- Find env files ---
@@ -337,28 +338,28 @@ fn eval_env(
     }
     script.push_str(&format!("env -0 > '{}'", after_path));
 
-    let output = Command::new("bash")
+    // Dup stderr as bash's stdout so .envrc output streams to terminal.
+    // Our stdout may be a pipe (fish sources it), so we can't inherit it.
+    // env -0 writes to files via explicit redirects, unaffected by fd 1.
+    let stderr_dup = io::stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|e| format!("dup stderr: {e}"))?;
+
+    let status = Command::new("bash")
         .arg("-e")
         .arg("-c")
         .arg(&script)
         .current_dir(dir)
-        .output()
+        .stdout(stderr_dup)
+        .stderr(io::stderr().as_fd().try_clone_to_owned().unwrap())
+        .status()
         .map_err(|e| format!("failed to run bash: {e}"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    if !status.success() {
         let _ = fs::remove_file(&before_path);
         let _ = fs::remove_file(&after_path);
-        // Show stderr first, then stdout (some scripts redirect stderr to stdout)
-        let detail = if !stderr.is_empty() {
-            stderr.into_owned()
-        } else if !stdout.is_empty() {
-            stdout.into_owned()
-        } else {
-            format!("exit code {}", output.status)
-        };
-        return Err(format!(".envrc evaluation failed:\n{detail}"));
+        return Err(".envrc evaluation failed".to_string());
     }
 
     let before_data = fs::read(&before_path).map_err(|e| format!("read before env: {e}"))?;
