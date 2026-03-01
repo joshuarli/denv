@@ -246,7 +246,10 @@ fn hook_fish_output() {
     let t = TestEnv::new();
     let r = t.denv(&["hook", "fish"]);
     assert!(r.success);
-    assert!(r.stdout.contains("function __denv_export --on-variable PWD"));
+    assert!(
+        r.stdout
+            .contains("function __denv_export --on-variable PWD")
+    );
     assert!(r.stdout.contains("denv export fish | source"));
     assert!(r.stdout.contains("%self"));
 }
@@ -353,7 +356,10 @@ fn denv_dir_set_on_activate() {
 
     let r = t.denv(&["allow"]);
     let proj = t.proj.canonicalize().unwrap();
-    assert!(r.stdout.contains(&format!("set -gx __DENV_DIR '{}';", proj.display())));
+    assert!(
+        r.stdout
+            .contains(&format!("set -gx __DENV_DIR '{}';", proj.display()))
+    );
     assert!(r.stdout.contains("set -e __DENV_DIRTY;"));
 }
 
@@ -376,7 +382,10 @@ fn denv_dirty_when_blocked() {
     // Not allowed → should set __DENV_DIR but also __DENV_DIRTY
     let r = t.denv(&["export", "fish"]);
     let proj = t.proj.canonicalize().unwrap();
-    assert!(r.stdout.contains(&format!("set -gx __DENV_DIR '{}';", proj.display())));
+    assert!(
+        r.stdout
+            .contains(&format!("set -gx __DENV_DIR '{}';", proj.display()))
+    );
     assert!(r.stdout.contains("set -gx __DENV_DIRTY 1;"));
 }
 

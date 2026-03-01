@@ -408,12 +408,14 @@ fn cmd_export_fish(pid: &str, force: bool) {
         .dir
         .canonicalize()
         .unwrap_or_else(|_| found.dir.clone());
-    let envrc = found.envrc.as_ref().map(|p| {
-        p.canonicalize().unwrap_or_else(|_| p.clone())
-    });
-    let dotenv = found.dotenv.as_ref().map(|p| {
-        p.canonicalize().unwrap_or_else(|_| p.clone())
-    });
+    let envrc = found
+        .envrc
+        .as_ref()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+    let dotenv = found
+        .dotenv
+        .as_ref()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
 
     let envrc_mtime = envrc.as_ref().and_then(|p| mtime_of(p).ok()).unwrap_or(0);
     let dotenv_mtime = dotenv.as_ref().and_then(|p| mtime_of(p).ok()).unwrap_or(0);
@@ -442,7 +444,12 @@ fn cmd_export_fish(pid: &str, force: bool) {
                 "denv: {} is blocked. Run `denv allow` to trust it.",
                 envrc_path.display()
             );
-            writeln!(out, "set -gx __DENV_DIR {};", fish_escape(&dir.to_string_lossy())).unwrap();
+            writeln!(
+                out,
+                "set -gx __DENV_DIR {};",
+                fish_escape(&dir.to_string_lossy())
+            )
+            .unwrap();
             writeln!(out, "set -gx __DENV_DIRTY 1;").unwrap();
             clear_active(pid);
             return;
@@ -485,7 +492,12 @@ fn cmd_export_fish(pid: &str, force: bool) {
     }
 
     emit_fish_diff(&diff, &mut out);
-    writeln!(out, "set -gx __DENV_DIR {};", fish_escape(&dir.to_string_lossy())).unwrap();
+    writeln!(
+        out,
+        "set -gx __DENV_DIR {};",
+        fish_escape(&dir.to_string_lossy())
+    )
+    .unwrap();
     writeln!(out, "set -e __DENV_DIRTY;").unwrap();
     save_active(
         pid,
@@ -522,7 +534,9 @@ fn run() -> Result<(), String> {
         "allow" => {
             let cwd = env::current_dir().map_err(|e| format!("cannot get cwd: {e}"))?;
             let found = find_env_files(&cwd).ok_or("no .envrc or .env found")?;
-            let envrc = found.envrc.ok_or("no .envrc found (only .env files need no approval)")?;
+            let envrc = found
+                .envrc
+                .ok_or("no .envrc found (only .env files need no approval)")?;
             let envrc = envrc.canonicalize().unwrap_or(envrc);
             cmd_allow(&envrc);
             if let Ok(pid) = env::var("__DENV_PID") {
