@@ -277,7 +277,48 @@ struct EnvDiff {
     unset: Vec<String>,
 }
 
+// direnv stdlib compat — prepended before sourcing .envrc
+const DIRENV_STDLIB: &str = r#"
+PATH_add() {
+  local p
+  for p in "$@"; do
+    [ "${p#/}" = "$p" ] && p="$PWD/$p"
+    export PATH="$p:$PATH"
+  done
+}
+path_add() {
+  local var="$1"; shift
+  local p
+  for p in "$@"; do
+    [ "${p#/}" = "$p" ] && p="$PWD/$p"
+    eval "export $var=\"$p:\${$var}\""
+  done
+}
+has() { command -v "$1" >/dev/null 2>&1; }
+watch_file() { :; }
+source_env() { [ -f "$1" ] && . "$1"; }
+source_env_if_exists() { [ -f "$1" ] && . "$1" || :; }
+source_up() {
+  local d="$PWD"
+  while d="$(dirname "$d")" && [ "$d" != "/" ]; do
+    if [ -f "$d/.envrc" ]; then . "$d/.envrc"; return; fi
+  done
+}
+source_up_if_exists() { source_up 2>/dev/null || :; }
+dotenv() {
+  local f="${1:-.env}"
+  [ -f "$f" ] || return 1
+  set -a; . "$f"; set +a
+}
+dotenv_if_exists() { dotenv "${1:-.env}" 2>/dev/null || :; }
+log_status() { echo "denv: $*" >&2; }
+log_error() { echo "denv: error: $*" >&2; }
+strict_env() { set -euo pipefail; }
+unstrict_env() { set +euo pipefail; }
+"#;
+
 fn eval_env(
+    dir: &Path,
     envrc: Option<&Path>,
     dotenv_entries: &[(String, String)],
     pid: &str,
@@ -285,7 +326,9 @@ fn eval_env(
     let before_path = format!("/tmp/denv_before_{pid}");
     let after_path = format!("/tmp/denv_after_{pid}");
 
-    let mut script = format!("env -0 > '{}'\n", before_path);
+    let mut script = String::new();
+    script.push_str(DIRENV_STDLIB);
+    script.push_str(&format!("env -0 > '{}'\n", before_path));
     if let Some(envrc) = envrc {
         script.push_str(&format!(". '{}'\n", envrc.display()));
     }
@@ -298,6 +341,7 @@ fn eval_env(
         .arg("-e")
         .arg("-c")
         .arg(&script)
+        .current_dir(dir)
         .output()
         .map_err(|e| format!("failed to run bash: {e}"))?;
 
@@ -383,7 +427,47 @@ fn emit_fish_diff(diff: &EnvDiff, stdout: &mut impl Write) {
     }
 }
 
+// --- Summary ---
+
+fn print_diff_summary(diff: &EnvDiff) {
+    let mut parts: Vec<String> = Vec::new();
+    for (k, _) in &diff.set {
+        if !k.starts_with("__DENV_") {
+            parts.push(format!("+{k}"));
+        }
+    }
+    for k in &diff.unset {
+        if !k.starts_with("__DENV_") {
+            parts.push(format!("-{k}"));
+        }
+    }
+    if !parts.is_empty() {
+        eprintln!("denv: {}", parts.join(" "));
+    }
+}
+
+fn print_unload_summary(prev: &[PrevVar]) {
+    let mut parts: Vec<String> = Vec::new();
+    for pv in prev {
+        let k = match pv {
+            PrevVar::Restore(k, _) | PrevVar::Unset(k) => k,
+        };
+        if !k.starts_with("__DENV_") {
+            parts.push(format!("-{k}"));
+        }
+    }
+    if !parts.is_empty() {
+        eprintln!("denv: {}", parts.join(" "));
+    }
+}
+
 // --- Export command ---
+
+fn parse_denv_state(s: &str) -> Option<(u64, u64, &str)> {
+    let (envrc_str, rest) = s.split_once(' ')?;
+    let (dotenv_str, dir) = rest.split_once(' ')?;
+    Some((envrc_str.parse().ok()?, dotenv_str.parse().ok()?, dir))
+}
 
 fn cmd_export_fish(pid: &str, force: bool) {
     let stdout = io::stdout();
@@ -391,18 +475,63 @@ fn cmd_export_fish(pid: &str, force: bool) {
 
     let cwd = env::current_dir().expect("cannot get cwd");
     let found = find_env_files(&cwd);
-    let active = load_active(pid);
 
     let Some(found) = found else {
-        // No .envrc or .env found
-        if let Some(state) = active {
+        // No .envrc or .env found — restore if we had active state
+        if let Some(state) = load_active(pid) {
             emit_fish_restore(&state.prev, &mut out);
             writeln!(out, "set -e __DENV_DIR;").unwrap();
             writeln!(out, "set -e __DENV_DIRTY;").unwrap();
+            writeln!(out, "set -e __DENV_STATE;").unwrap();
             clear_active(pid);
+            print_unload_summary(&state.prev);
         }
         return;
     };
+
+    // Cheap mtime checks before any canonicalize or disk reads
+    let envrc_mtime = found
+        .envrc
+        .as_ref()
+        .and_then(|p| mtime_of(p).ok())
+        .unwrap_or(0);
+    let dotenv_mtime = found
+        .dotenv
+        .as_ref()
+        .and_then(|p| mtime_of(p).ok())
+        .unwrap_or(0);
+
+    // Fast path 1: env var check — zero disk reads
+    if !force {
+        if let Ok(state_str) = env::var("__DENV_STATE") {
+            if let Some((st_envrc, st_dotenv, st_dir)) = parse_denv_state(&state_str) {
+                if st_envrc == envrc_mtime
+                    && st_dotenv == dotenv_mtime
+                    && (st_dir == found.dir.to_string_lossy().as_ref()
+                        || found
+                            .dir
+                            .canonicalize()
+                            .map_or(false, |c| st_dir == c.to_string_lossy().as_ref()))
+                {
+                    return;
+                }
+            }
+        }
+    }
+
+    // Fast path 2: active file check — one disk read (fallback when env var not set)
+    let active = load_active(pid);
+    if !force {
+        if let Some(ref state) = active {
+            if state.envrc_mtime == envrc_mtime
+                && state.dotenv_mtime == dotenv_mtime
+                && (state.dir == found.dir
+                    || state.dir == found.dir.canonicalize().unwrap_or_default())
+            {
+                return;
+            }
+        }
+    }
 
     let dir = found
         .dir
@@ -416,21 +545,6 @@ fn cmd_export_fish(pid: &str, force: bool) {
         .dotenv
         .as_ref()
         .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
-
-    let envrc_mtime = envrc.as_ref().and_then(|p| mtime_of(p).ok()).unwrap_or(0);
-    let dotenv_mtime = dotenv.as_ref().and_then(|p| mtime_of(p).ok()).unwrap_or(0);
-
-    // Fast path: same dir, same mtimes
-    if !force {
-        if let Some(ref state) = active {
-            if state.dir == dir
-                && state.envrc_mtime == envrc_mtime
-                && state.dotenv_mtime == dotenv_mtime
-            {
-                return;
-            }
-        }
-    }
 
     // Restore previous state before loading new
     if let Some(ref state) = active {
@@ -451,6 +565,10 @@ fn cmd_export_fish(pid: &str, force: bool) {
             )
             .unwrap();
             writeln!(out, "set -gx __DENV_DIRTY 1;").unwrap();
+            writeln!(out, "set -e __DENV_STATE;").unwrap();
+            if let Some(ref state) = active {
+                print_unload_summary(&state.prev);
+            }
             clear_active(pid);
             return;
         }
@@ -469,7 +587,7 @@ fn cmd_export_fish(pid: &str, force: bool) {
     };
 
     // Eval: .envrc (if present) then .env entries layered on top
-    let diff = match eval_env(envrc.as_deref(), &dotenv_entries, pid) {
+    let diff = match eval_env(&dir, envrc.as_deref(), &dotenv_entries, pid) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("denv: {e}");
@@ -499,6 +617,9 @@ fn cmd_export_fish(pid: &str, force: bool) {
     )
     .unwrap();
     writeln!(out, "set -e __DENV_DIRTY;").unwrap();
+    let state_val = format!("{} {} {}", envrc_mtime, dotenv_mtime, dir.display());
+    writeln!(out, "set -gx __DENV_STATE {};", fish_escape(&state_val)).unwrap();
+    print_diff_summary(&diff);
     save_active(
         pid,
         &ActiveState {
@@ -515,6 +636,15 @@ fn cmd_export_fish(pid: &str, force: bool) {
 const FISH_HOOK: &str = r#"function __denv_export --on-variable PWD
     set -gx __DENV_PID %self
     denv export fish | source
+end
+function denv --wraps denv
+    set -gx __DENV_PID %self
+    switch "$argv[1]"
+        case allow deny reload
+            command denv $argv | source
+        case '*'
+            command denv $argv
+    end
 end
 set -gx __DENV_PID %self
 denv export fish | source
@@ -549,6 +679,9 @@ fn run() -> Result<(), String> {
             let envrc = found.envrc.ok_or("no .envrc found")?;
             let envrc = envrc.canonicalize().unwrap_or(envrc);
             cmd_deny(&envrc);
+            if let Ok(pid) = env::var("__DENV_PID") {
+                cmd_export_fish(&pid, true);
+            }
         }
         "export" => {
             if args.get(2).map(|s| s.as_str()) != Some("fish") {
