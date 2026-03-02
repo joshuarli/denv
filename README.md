@@ -60,3 +60,6 @@ Editing `.envrc` changes its mtime, which invalidates trust until you re-run `de
 ## direnv compat
 
 `.envrc` scripts can use common direnv stdlib functions: `PATH_add`, `path_add`, `has`, `source_env`, `source_up`, `dotenv`, `strict_env`, `log_status`, and others.
+
+`layout*` and some nontrivial or specialized things are not supported.
+And of course, direnv-daemon specific stuff are not supported.
