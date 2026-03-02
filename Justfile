@@ -1,4 +1,5 @@
-target := arch() + "-apple-darwin"
+target  := arch() + "-apple-darwin"
+nightly := "nightly-2026-02-23"
 
 build:
     cargo build
@@ -6,7 +7,7 @@ build:
 release:
     cargo clean -p denv --release --target {{ target }}
     RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
-    cargo +nightly build --release \
+    cargo +{{ nightly }} build --release \
       -Z build-std=std \
       -Z build-std-features= \
       --target {{ target }}
