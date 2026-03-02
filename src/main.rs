@@ -368,6 +368,20 @@ path_add() {
     eval "export $var=\"$p:\${$var}\""
   done
 }
+PATH_rm() {
+  local new_path p pattern
+  for pattern in "$@"; do
+    new_path=
+    local IFS=:
+    for p in $PATH; do
+      case "$p" in
+        $pattern) ;;
+        *) new_path="${new_path:+$new_path:}$p" ;;
+      esac
+    done
+    export PATH="$new_path"
+  done
+}
 has() { command -v "$1" >/dev/null 2>&1; }
 watch_file() { :; }
 source_env() { [ -f "$1" ] && . "$1"; }
