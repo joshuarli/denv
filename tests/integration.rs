@@ -831,11 +831,7 @@ fn bash_unset_syntax() {
 
     let r = t.denv_bash_in(Path::new("/tmp"), &["export", "bash"]);
     assert!(r.success);
-    assert!(
-        r.stdout.contains("unset FOO;"),
-        "stdout: {}",
-        r.stdout
-    );
+    assert!(r.stdout.contains("unset FOO;"), "stdout: {}", r.stdout);
 }
 
 #[test]

@@ -714,8 +714,7 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) {
         && let Some(ref state) = active
         && state.envrc_mtime == envrc_mtime
         && state.dotenv_mtime == dotenv_mtime
-        && (state.dir == found.dir
-            || state.dir == found.dir.canonicalize().unwrap_or_default())
+        && (state.dir == found.dir || state.dir == found.dir.canonicalize().unwrap_or_default())
     {
         return;
     }
@@ -779,12 +778,18 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) {
                 set.push((k.to_string(), v.to_string()));
             }
         }
-        EnvDiff { set, unset: Vec::new() }
+        EnvDiff {
+            set,
+            unset: Vec::new(),
+        }
     } else {
         match eval_env(&dir, envrc.as_deref(), &dotenv_entries, pid) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("denv: {e}");
+                emit_export(&mut out, shell, "__DENV_DIR", &dir.to_string_lossy());
+                emit_export(&mut out, shell, "__DENV_DIRTY", "1");
+                emit_unset(&mut out, shell, "__DENV_STATE");
                 return;
             }
         }
@@ -805,12 +810,7 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) {
     }
 
     emit_diff(&diff, shell, &mut out);
-    emit_export(
-        &mut out,
-        shell,
-        "__DENV_DIR",
-        &dir.to_string_lossy(),
-    );
+    emit_export(&mut out, shell, "__DENV_DIR", &dir.to_string_lossy());
     emit_unset(&mut out, shell, "__DENV_DIRTY");
     emit_export(
         &mut out,
@@ -904,8 +904,7 @@ fn run() -> Result<(), String> {
             } else {
                 cmd_deny(&envrc)
             }
-            if let (Ok(pid), Ok(shell_str)) =
-                (env::var("__DENV_PID"), env::var("__DENV_SHELL"))
+            if let (Ok(pid), Ok(shell_str)) = (env::var("__DENV_PID"), env::var("__DENV_SHELL"))
                 && let Some(shell) = Shell::from_str(&shell_str)
             {
                 cmd_export(&pid, true, shell);
