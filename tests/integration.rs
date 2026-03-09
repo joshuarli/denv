@@ -63,8 +63,11 @@ impl TestEnv {
     fn denv_in_env(&self, cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> DenvCmd {
         let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
         let mut cmd = Command::new(denv_bin());
-        cmd.args(args)
+        cmd.env_clear()
+            .args(args)
             .current_dir(cwd)
+            .env("PATH", std::env::var("PATH").unwrap())
+            .env("HOME", std::env::var("HOME").unwrap())
             .env("PWD", &canonical_cwd)
             .env("DENV_DATA_DIR", &self.data)
             .env("__DENV_PID", &self.pid)
@@ -372,7 +375,8 @@ fn envrc_error_in_script() {
 
     let r = t.allow();
     assert!(r.stderr.contains("evaluation failed"));
-    assert!(r.stdout.is_empty());
+    assert!(r.stdout.contains("__DENV_DIRTY"));
+    assert!(!r.stdout.contains("set -gx FOO"));
 }
 
 #[test]
