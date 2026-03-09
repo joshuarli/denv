@@ -1,0 +1,30 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - 'release/*'
+
+jobs:
+  build:
+    name: Build release
+    runs-on: macos-15
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: test and release
+        run: |
+          make test-ci
+          make release
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ github.ref_name }}" "target/aarch64-apple-darwin/release/denv#denv-${{ github.ref_name }}-aarch64-apple-darwin" --title "${{ github.ref_name }}"

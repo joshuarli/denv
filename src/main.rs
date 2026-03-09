@@ -887,11 +887,19 @@ eval "$(command denv export zsh)"
 fn run() -> Result<(), String> {
     let cmd = env::args().nth(1);
     let Some(cmd) = cmd.as_deref() else {
+        eprintln!(
+            "denv {} — fast environment loader",
+            env!("CARGO_PKG_VERSION")
+        );
         eprintln!("usage: denv <allow|deny|export <fish|bash|zsh>|reload|hook <fish|bash|zsh>>");
         std::process::exit(1);
     };
 
     match cmd {
+        "-V" | "--version" => {
+            println!("denv {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         "allow" | "deny" => {
             let cwd = env::var_os("PWD")
                 .map(PathBuf::from)
