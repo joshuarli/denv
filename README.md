@@ -1,6 +1,8 @@
 # denv
 
-Minimal direnv.
+A fast, minimal [direnv](https://direnv.net). Zero dependencies, single static Rust binary (378K stripped), direnv-compatible `.envrc` scripts.
+
+direnv runs on every `cd`. It's an 8MB Go binary that has to initialize its runtime even when nothing changed. denv solves this by being small, doing as little work as possible on the noop path, and avoiding the subprocess entirely as much as possible in the hook.
 
 
 ## Install
@@ -49,13 +51,18 @@ When both exist, `.env` is loaded after `.envrc` — `.env` wins on conflicts.
 
 ## How it works
 
-direnv runs on every `cd` by nature. It's a larger binary and has a whole Go runtime to initialize. Even if it early exits in the noop case it still costs enough to feel the latency. We solve that by being extremely small and noop exiting as fast as possible.
-
-On every `cd`, the shell hook runs `denv export <shell>`. denv walks up from the current directory looking for `.envrc` or `.env`. If found and trusted, it spawns one bash subprocess to evaluate the script, diffs the environment before/after, and emits shell-appropriate commands (`set -gx`/`export`/`unset`) for the shell to source.
+On `cd`, the shell hook runs `denv export <shell>`. denv walks up from the current directory looking for `.envrc` or `.env`. If found and trusted, it spawns one bash subprocess to evaluate the script, diffs the environment before/after, and emits shell-appropriate commands (`set -gx`/`export`/`unset`) for the shell to source.
 
 Per-shell state is tracked by PID so multiple terminals stay independent. When you leave a directory, previous values are restored exactly.
 
 Editing `.envrc` changes its mtime, which invalidates trust until you re-run `denv allow`. This prevents stale or tampered scripts from running silently.
+
+### Noop fast path
+
+The common case — cd'ing within a project where nothing changed — is heavily optimized:
+
+- **All shells**: The hook checks `__DENV_STATE` and uses `test -nt` against a sentinel file to detect edits and deletions. If the directory matches and no files changed, it returns immediately — **zero subprocesses, zero forks.** direnv spawns the full binary unconditionally on every prompt.
+- **Binary** (when the subprocess *is* needed): 378K stripped Rust with fat LTO, `panic = "abort"`, zero runtime dependencies. direnv is 8MB of Go.
 
 ## direnv compat
 

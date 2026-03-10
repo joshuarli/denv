@@ -944,26 +944,78 @@ set -gx __DENV_SHELL fish
 denv export fish | source
 "#;
 
-const BASH_HOOK: &str = r#"__denv_export() { eval "$(command denv export bash)"; }
+const BASH_HOOK: &str = r#"__denv_export() {
+    # Noop: same dir, files unchanged → skip subprocess.
+    if [ -n "$__DENV_STATE" ] && [ -n "$__DENV_SENTINEL" ]; then
+        local _dir="${__DENV_STATE#* * }"
+        case "$PWD" in
+            "$_dir"|"$_dir"/*)
+                if [ -f "$__DENV_SENTINEL" ] \
+                    && [ ! "$_dir/.envrc" -nt "$__DENV_SENTINEL" ] \
+                    && [ ! "$_dir/.env" -nt "$__DENV_SENTINEL" ]; then
+                    local _em="${__DENV_STATE%% *}"
+                    local _dm="${__DENV_STATE#* }"; _dm="${_dm%% *}"
+                    if { [ "$_em" = 0 ] || [ -f "$_dir/.envrc" ]; } \
+                        && { [ "$_dm" = 0 ] || [ -f "$_dir/.env" ]; }; then
+                        return
+                    fi
+                fi ;;
+        esac
+    fi
+    eval "$(command denv export bash)"
+}
 denv() {
     case "$1" in
         allow|deny|reload) eval "$(command denv "$@")" ;;
         *) command denv "$@" ;;
     esac
 }
+if [ -n "$DENV_DATA_DIR" ]; then
+    __DENV_SENTINEL="$DENV_DATA_DIR/active_$$"
+elif [ -n "$XDG_DATA_HOME" ]; then
+    __DENV_SENTINEL="$XDG_DATA_HOME/denv/active_$$"
+else
+    __DENV_SENTINEL="$HOME/.local/share/denv/active_$$"
+fi
 export __DENV_PID=$$
 export __DENV_SHELL=bash
 PROMPT_COMMAND="__denv_export${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 eval "$(command denv export bash)"
 "#;
 
-const ZSH_HOOK: &str = r#"__denv_export() { eval "$(command denv export zsh)"; }
+const ZSH_HOOK: &str = r#"__denv_export() {
+    # Noop: same dir, files unchanged → skip subprocess.
+    if [[ -n "$__DENV_STATE" ]] && [[ -n "$__DENV_SENTINEL" ]]; then
+        local _dir="${__DENV_STATE#* * }"
+        case "$PWD" in
+            "$_dir"|"$_dir"/*)
+                if [[ -f "$__DENV_SENTINEL" ]] \
+                    && [[ ! "$_dir/.envrc" -nt "$__DENV_SENTINEL" ]] \
+                    && [[ ! "$_dir/.env" -nt "$__DENV_SENTINEL" ]]; then
+                    local _em="${__DENV_STATE%% *}"
+                    local _dm="${__DENV_STATE#* }"; _dm="${_dm%% *}"
+                    if { [[ "$_em" == 0 ]] || [[ -f "$_dir/.envrc" ]]; } \
+                        && { [[ "$_dm" == 0 ]] || [[ -f "$_dir/.env" ]]; }; then
+                        return
+                    fi
+                fi ;;
+        esac
+    fi
+    eval "$(command denv export zsh)"
+}
 denv() {
     case "$1" in
         allow|deny|reload) eval "$(command denv "$@")" ;;
         *) command denv "$@" ;;
     esac
 }
+if [[ -n "$DENV_DATA_DIR" ]]; then
+    __DENV_SENTINEL="$DENV_DATA_DIR/active_$$"
+elif [[ -n "$XDG_DATA_HOME" ]]; then
+    __DENV_SENTINEL="$XDG_DATA_HOME/denv/active_$$"
+else
+    __DENV_SENTINEL="$HOME/.local/share/denv/active_$$"
+fi
 export __DENV_PID=$$
 export __DENV_SHELL=zsh
 autoload -Uz add-zsh-hook

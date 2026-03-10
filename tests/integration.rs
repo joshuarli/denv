@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1776,4 +1777,421 @@ fn hook_requires_valid_shell() {
     let r = t.denv(&["hook", "powershell"]);
     assert!(!r.success);
     assert!(r.stderr.contains("usage"));
+}
+
+// --- Shell hook noop tests ---
+//
+// These verify that the shell-side noop check in each hook skips the denv
+// subprocess entirely when nothing changed. The trick: after initial setup
+// with the real binary, we swap `denv` in PATH for a fake that touches a
+// marker file. If __denv_export returns without calling the fake, the noop
+// worked.
+
+/// Build a fake denv script that writes a marker file when invoked.
+fn write_fake_denv(dir: &Path, marker: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    let script = format!("#!/bin/bash\ntouch '{}'\n", marker.display());
+    let path = dir.join("denv");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn bash_hook_noop_skips_subprocess() {
+    let t = TestEnv::new();
+    t.write_envrc("export FOO=bar");
+
+    let base = t.proj.parent().unwrap();
+    let fake_dir = base.join("fakebin");
+    let marker = base.join("denv_called_bash");
+    write_fake_denv(&fake_dir, &marker);
+
+    let bin_dir = denv_bin().parent().unwrap().to_path_buf();
+    let proj = t.proj.canonicalize().unwrap();
+
+    let script = format!(
+        r#"
+set -e
+export DENV_DATA_DIR='{data}'
+export HOME='{home}'
+export PATH='{bin_dir}:{path}'
+cd '{proj}'
+
+# Source the hook (defines functions, sets sentinel, runs initial export)
+eval "$(command denv hook bash)"
+
+# Allow and activate the envrc
+denv allow
+
+# Sanity: __DENV_STATE must be set
+if [ -z "$__DENV_STATE" ]; then
+    echo "FAIL: __DENV_STATE not set after allow" >&2
+    exit 1
+fi
+
+# Swap denv for the fake
+export PATH='{fake_dir}:{path}'
+
+# Trigger the hook again (simulates next prompt)
+__denv_export
+
+# Check marker
+if [ -f '{marker}' ]; then
+    echo "FAIL: subprocess was called on noop" >&2
+    exit 1
+fi
+"#,
+        data = t.data.display(),
+        home = std::env::var("HOME").unwrap(),
+        bin_dir = bin_dir.display(),
+        path = std::env::var("PATH").unwrap(),
+        proj = proj.display(),
+        fake_dir = fake_dir.display(),
+        marker = marker.display(),
+    );
+
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("failed to run bash");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "bash noop test failed: {stderr}");
+    assert!(!marker.exists(), "bash hook called subprocess on noop");
+}
+
+#[test]
+fn bash_hook_noop_calls_subprocess_on_edit() {
+    let t = TestEnv::new();
+    t.write_envrc("export FOO=bar");
+
+    let base = t.proj.parent().unwrap();
+    let fake_dir = base.join("fakebin_edit");
+    let marker = base.join("denv_called_bash_edit");
+    write_fake_denv(&fake_dir, &marker);
+
+    let bin_dir = denv_bin().parent().unwrap().to_path_buf();
+    let proj = t.proj.canonicalize().unwrap();
+
+    let script = format!(
+        r#"
+set -e
+export DENV_DATA_DIR='{data}'
+export HOME='{home}'
+export PATH='{bin_dir}:{path}'
+cd '{proj}'
+
+eval "$(command denv hook bash)"
+denv allow
+
+# Wait so mtime changes, then edit the file
+sleep 1.1
+echo 'export FOO=changed' > .envrc
+
+# Swap in the fake
+export PATH='{fake_dir}:{path}'
+
+# Trigger the hook — should NOT be a noop since .envrc was edited
+__denv_export || true
+
+if [ ! -f '{marker}' ]; then
+    echo "FAIL: subprocess was NOT called after edit" >&2
+    exit 1
+fi
+"#,
+        data = t.data.display(),
+        home = std::env::var("HOME").unwrap(),
+        bin_dir = bin_dir.display(),
+        path = std::env::var("PATH").unwrap(),
+        proj = proj.display(),
+        fake_dir = fake_dir.display(),
+        marker = marker.display(),
+    );
+
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("failed to run bash");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "bash edit test failed: {stderr}");
+    assert!(
+        marker.exists(),
+        "bash hook should call subprocess after .envrc edit"
+    );
+}
+
+#[test]
+fn zsh_hook_noop_skips_subprocess() {
+    let t = TestEnv::new();
+    t.write_envrc("export FOO=bar");
+
+    let base = t.proj.parent().unwrap();
+    let fake_dir = base.join("fakebin_zsh");
+    let marker = base.join("denv_called_zsh");
+    write_fake_denv(&fake_dir, &marker);
+
+    let bin_dir = denv_bin().parent().unwrap().to_path_buf();
+    let proj = t.proj.canonicalize().unwrap();
+
+    let script = format!(
+        r#"
+set -e
+export DENV_DATA_DIR='{data}'
+export HOME='{home}'
+export PATH='{bin_dir}:{path}'
+cd '{proj}'
+
+# Source the hook (zsh)
+eval "$(command denv hook zsh)"
+
+# Allow and activate
+denv allow
+
+if [[ -z "$__DENV_STATE" ]]; then
+    echo "FAIL: __DENV_STATE not set after allow" >&2
+    exit 1
+fi
+
+# Swap in fake
+export PATH='{fake_dir}:{path}'
+
+# Trigger the hook (simulates next precmd)
+__denv_export
+
+if [[ -f '{marker}' ]]; then
+    echo "FAIL: subprocess was called on noop" >&2
+    exit 1
+fi
+"#,
+        data = t.data.display(),
+        home = std::env::var("HOME").unwrap(),
+        bin_dir = bin_dir.display(),
+        path = std::env::var("PATH").unwrap(),
+        proj = proj.display(),
+        fake_dir = fake_dir.display(),
+        marker = marker.display(),
+    );
+
+    let output = Command::new("zsh")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("failed to run zsh");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "zsh noop test failed: {stderr}");
+    assert!(!marker.exists(), "zsh hook called subprocess on noop");
+}
+
+#[test]
+fn zsh_hook_noop_calls_subprocess_on_edit() {
+    let t = TestEnv::new();
+    t.write_envrc("export FOO=bar");
+
+    let base = t.proj.parent().unwrap();
+    let fake_dir = base.join("fakebin_zsh_edit");
+    let marker = base.join("denv_called_zsh_edit");
+    write_fake_denv(&fake_dir, &marker);
+
+    let bin_dir = denv_bin().parent().unwrap().to_path_buf();
+    let proj = t.proj.canonicalize().unwrap();
+
+    let script = format!(
+        r#"
+set -e
+export DENV_DATA_DIR='{data}'
+export HOME='{home}'
+export PATH='{bin_dir}:{path}'
+cd '{proj}'
+
+eval "$(command denv hook zsh)"
+denv allow
+
+sleep 1.1
+echo 'export FOO=changed' > .envrc
+
+export PATH='{fake_dir}:{path}'
+
+__denv_export || true
+
+if [[ ! -f '{marker}' ]]; then
+    echo "FAIL: subprocess was NOT called after edit" >&2
+    exit 1
+fi
+"#,
+        data = t.data.display(),
+        home = std::env::var("HOME").unwrap(),
+        bin_dir = bin_dir.display(),
+        path = std::env::var("PATH").unwrap(),
+        proj = proj.display(),
+        fake_dir = fake_dir.display(),
+        marker = marker.display(),
+    );
+
+    let output = Command::new("zsh")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("failed to run zsh");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "zsh edit test failed: {stderr}");
+    assert!(
+        marker.exists(),
+        "zsh hook should call subprocess after .envrc edit"
+    );
+}
+
+#[test]
+fn fish_hook_noop_skips_subprocess() {
+    // Skip if fish not installed
+    if Command::new("fish").arg("--version").output().is_err() {
+        eprintln!("skipping: fish not installed");
+        return;
+    }
+
+    let t = TestEnv::new();
+    t.write_envrc("export FOO=bar");
+
+    let base = t.proj.parent().unwrap();
+    let fake_dir = base.join("fakebin_fish");
+    let marker = base.join("denv_called_fish");
+    // Fish uses `command denv` which finds the first `denv` in PATH, so a
+    // bash shebang fake works fine.
+    write_fake_denv(&fake_dir, &marker);
+
+    let bin_dir = denv_bin().parent().unwrap().to_path_buf();
+    let proj = t.proj.canonicalize().unwrap();
+
+    // Fish hook fires on `--on-variable PWD`. To test the noop, we:
+    // 1. Source the hook with real denv (sets up __DENV_SENTINEL, initial export)
+    // 2. Allow the envrc (activates, sets __DENV_STATE)
+    // 3. Swap denv for fake
+    // 4. Set PWD to trigger __denv_export (or call it directly)
+    // 5. Check marker
+    let script = format!(
+        r#"
+set -gx DENV_DATA_DIR '{data}'
+set -gx HOME '{home}'
+set -gx PATH '{bin_dir}' {path}
+cd '{proj}'
+
+# Source the hook
+denv hook fish | source
+
+# Allow and activate
+denv allow | source
+
+if not set -q __DENV_STATE
+    echo "FAIL: __DENV_STATE not set after allow" >&2
+    exit 1
+end
+
+# Swap in fake denv
+set -gx PATH '{fake_dir}' {path}
+
+# Call the hook function directly (simulates PWD change to same dir)
+__denv_export
+
+if test -f '{marker}'
+    echo "FAIL: subprocess was called on noop" >&2
+    exit 1
+end
+"#,
+        data = t.data.display(),
+        home = std::env::var("HOME").unwrap(),
+        bin_dir = bin_dir.display(),
+        path = std::env::var("PATH")
+            .unwrap()
+            .split(':')
+            .map(|p| format!("'{p}'"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        proj = proj.display(),
+        fake_dir = fake_dir.display(),
+        marker = marker.display(),
+    );
+
+    let output = Command::new("fish")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("failed to run fish");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "fish noop test failed: {stderr}");
+    assert!(!marker.exists(), "fish hook called subprocess on noop");
+}
+
+#[test]
+fn fish_hook_noop_calls_subprocess_on_edit() {
+    if Command::new("fish").arg("--version").output().is_err() {
+        eprintln!("skipping: fish not installed");
+        return;
+    }
+
+    let t = TestEnv::new();
+    t.write_envrc("export FOO=bar");
+
+    let base = t.proj.parent().unwrap();
+    let fake_dir = base.join("fakebin_fish_edit");
+    let marker = base.join("denv_called_fish_edit");
+    write_fake_denv(&fake_dir, &marker);
+
+    let bin_dir = denv_bin().parent().unwrap().to_path_buf();
+    let proj = t.proj.canonicalize().unwrap();
+
+    let script = format!(
+        r#"
+set -gx DENV_DATA_DIR '{data}'
+set -gx HOME '{home}'
+set -gx PATH '{bin_dir}' {path}
+cd '{proj}'
+
+denv hook fish | source
+denv allow | source
+
+# Wait and edit .envrc so mtime changes
+sleep 1.1
+echo 'export FOO=changed' > .envrc
+
+# Swap in fake
+set -gx PATH '{fake_dir}' {path}
+
+__denv_export; or true
+
+if not test -f '{marker}'
+    echo "FAIL: subprocess was NOT called after edit" >&2
+    exit 1
+end
+"#,
+        data = t.data.display(),
+        home = std::env::var("HOME").unwrap(),
+        bin_dir = bin_dir.display(),
+        path = std::env::var("PATH")
+            .unwrap()
+            .split(':')
+            .map(|p| format!("'{p}'"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        proj = proj.display(),
+        fake_dir = fake_dir.display(),
+        marker = marker.display(),
+    );
+
+    let output = Command::new("fish")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("failed to run fish");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "fish edit test failed: {stderr}");
+    assert!(
+        marker.exists(),
+        "fish hook should call subprocess after .envrc edit"
+    );
 }
