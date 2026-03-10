@@ -1040,6 +1040,728 @@ fn dotenv_only_with_envrc_still_uses_bash() {
     assert!(r.stdout.contains("FROM_DOTENV"));
 }
 
+// --- .envrc edge cases ---
+
+#[test]
+fn envrc_empty_is_noop() {
+    let t = TestEnv::new();
+    t.write_envrc("");
+
+    let r = t.allow();
+    assert!(r.success);
+    // No user-visible vars set (only __DENV_* internals)
+    for line in r.stdout.lines() {
+        if line.contains("set -gx") && !line.contains("__DENV_") {
+            panic!("unexpected export: {line}");
+        }
+    }
+}
+
+#[test]
+fn envrc_newline_in_value() {
+    let t = TestEnv::new();
+    t.write_envrc(
+        r#"export MSG="line1
+line2""#,
+    );
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("set -gx MSG 'line1\nline2';"),
+        "stdout: {}",
+        r.stdout
+    );
+
+    // Leave and verify restore works (tests escape/unescape roundtrip through active state)
+    let r = t.denv_in(Path::new("/tmp"), &["export", "fish"]);
+    assert!(r.stdout.contains("set -e MSG;"));
+}
+
+#[test]
+fn envrc_empty_value() {
+    let t = TestEnv::new();
+    t.write_envrc("export EMPTY=''");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("set -gx EMPTY '';"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn envrc_value_with_equals() {
+    let t = TestEnv::new();
+    t.write_envrc("export DSN='postgres://u:p@host/db?opt=val'");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("postgres://u:p@host/db?opt=val"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn envrc_unicode_value() {
+    let t = TestEnv::new();
+    t.write_envrc("export GREETING='こんにちは'");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("set -gx GREETING 'こんにちは';"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn envrc_modifies_existing_var() {
+    let t = TestEnv::new();
+    t.write_envrc("export EXISTING=new_value");
+
+    let r = t.denv_in_env(&t.proj, &["allow"], &[("EXISTING", "old_value")]);
+    assert!(r.success);
+    assert!(r.stdout.contains("set -gx EXISTING 'new_value';"));
+
+    // Leave — should restore old value
+    let r = t.denv_in_env(
+        Path::new("/tmp"),
+        &["export", "fish"],
+        &[("EXISTING", "old_value")],
+    );
+    assert!(
+        r.stdout.contains("set -gx EXISTING 'old_value';"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn envrc_unsets_preexisting_var() {
+    let t = TestEnv::new();
+    t.write_envrc("unset REMOVE_ME\nexport KEEP=yes");
+
+    let r = t.denv_in_env(&t.proj, &["allow"], &[("REMOVE_ME", "was_here")]);
+    assert!(r.success);
+    assert!(r.stdout.contains("set -e REMOVE_ME;"));
+    assert!(r.stdout.contains("set -gx KEEP 'yes';"));
+}
+
+#[test]
+fn envrc_set_then_unset_is_noop_for_that_var() {
+    let t = TestEnv::new();
+    t.write_envrc("export TEMP_VAR=hello\nunset TEMP_VAR\nexport REAL=yes");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(r.stdout.contains("set -gx REAL 'yes';"));
+    assert!(
+        !r.stdout.contains("TEMP_VAR"),
+        "TEMP_VAR should not appear: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn envrc_long_value() {
+    let t = TestEnv::new();
+    let long_val = "x".repeat(10_000);
+    t.write_envrc(&format!("export BIG='{long_val}'"));
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(
+        r.stdout.contains(&long_val),
+        "long value should survive roundtrip"
+    );
+}
+
+#[test]
+fn envrc_special_chars_in_value() {
+    let t = TestEnv::new();
+    // Tabs, backticks, dollar signs, parens, brackets
+    t.write_envrc(r#"export SPECIAL='	`$()[]{}|&;<>'"#);
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(r.stdout.contains("set -gx SPECIAL"));
+}
+
+#[test]
+fn envrc_multiple_path_add() {
+    let t = TestEnv::new();
+    t.write_envrc("PATH_add bin\nPATH_add scripts\nPATH_add tools");
+
+    let r = t.allow();
+    assert!(r.success);
+    let proj = t.proj.canonicalize().unwrap();
+    let stdout = &r.stdout;
+    assert!(
+        stdout.contains(&format!("{}/bin", proj.display())),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("{}/scripts", proj.display())),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("{}/tools", proj.display())),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn envrc_strict_env() {
+    let t = TestEnv::new();
+    // strict_env enables set -euo pipefail; undefined var reference should fail
+    t.write_envrc("strict_env\necho $UNDEFINED_VAR_ABCXYZ\nexport FOO=bar");
+
+    let r = t.allow();
+    assert!(r.stderr.contains("evaluation failed"));
+    assert!(!r.stdout.contains("set -gx FOO"));
+}
+
+#[test]
+fn envrc_unstrict_after_strict() {
+    let t = TestEnv::new();
+    t.write_envrc("strict_env\nexport A=1\nunstrict_env\nexport B=2");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(r.stdout.contains("set -gx A '1';"));
+    assert!(r.stdout.contains("set -gx B '2';"));
+}
+
+#[test]
+fn envrc_source_env_nonexistent_is_silent() {
+    let t = TestEnv::new();
+    t.write_envrc("source_env_if_exists nonexistent.sh\nexport OK=1");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(r.stdout.contains("set -gx OK '1';"));
+}
+
+#[test]
+fn envrc_watch_file_is_noop() {
+    let t = TestEnv::new();
+    t.write_envrc("watch_file Makefile\nexport OK=1");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(r.stdout.contains("set -gx OK '1';"));
+}
+
+#[test]
+fn envrc_expand_path_relative() {
+    let t = TestEnv::new();
+    t.write_envrc("export EXPANDED=$(expand_path sub)");
+
+    let r = t.allow();
+    assert!(r.success);
+    let proj = t.proj.canonicalize().unwrap();
+    assert!(
+        r.stdout.contains(&format!("{}/sub", proj.display())),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn envrc_path_rm() {
+    let t = TestEnv::new();
+    t.write_envrc("PATH_add /custom/bin\nPATH_rm '/custom/bin'");
+
+    let r = t.allow();
+    assert!(r.success);
+    // /custom/bin added then removed — should not appear in final PATH
+    let path_line = r.stdout.lines().find(|l| l.starts_with("set -gx PATH "));
+    if let Some(line) = path_line {
+        assert!(
+            !line.contains("/custom/bin"),
+            "PATH_rm should have removed /custom/bin: {line}"
+        );
+    }
+}
+
+#[test]
+fn envrc_log_status_goes_to_stderr() {
+    let t = TestEnv::new();
+    t.write_envrc("log_status 'loading project'\nexport OK=1");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(r.stderr.contains("loading project"));
+    assert!(r.stdout.contains("set -gx OK '1';"));
+}
+
+#[test]
+fn envrc_log_error_goes_to_stderr() {
+    let t = TestEnv::new();
+    t.write_envrc("log_error 'something wrong'\nexport OK=1");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(r.stderr.contains("something wrong"));
+}
+
+#[test]
+fn envrc_conditional_export() {
+    let t = TestEnv::new();
+    t.write_envrc("if has bash; then export HAS_SHELL=1; fi\nif has totally_bogus_cmd; then export NOPE=1; fi");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(r.stdout.contains("set -gx HAS_SHELL '1';"));
+    assert!(!r.stdout.contains("NOPE"), "stdout: {}", r.stdout);
+}
+
+#[test]
+fn envrc_dotenv_override() {
+    // .env loaded after .envrc — .env wins for shared keys
+    let t = TestEnv::new();
+    t.write_envrc("export SHARED=from_envrc\nexport ENVRC_ONLY=1");
+    t.write_dotenv("SHARED=from_dotenv\nDOTENV_ONLY=1");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("set -gx SHARED 'from_dotenv';"),
+        "stdout: {}",
+        r.stdout
+    );
+    assert!(r.stdout.contains("ENVRC_ONLY"));
+    assert!(r.stdout.contains("DOTENV_ONLY"));
+}
+
+#[test]
+fn envrc_syntax_error() {
+    let t = TestEnv::new();
+    t.write_envrc("export FOO=bar\nif; then; fi");
+
+    let r = t.allow();
+    assert!(r.stderr.contains("evaluation failed"));
+    assert!(r.stdout.contains("__DENV_DIRTY"));
+}
+
+#[test]
+fn envrc_backslash_in_value() {
+    let t = TestEnv::new();
+    t.write_envrc(r#"export BS='back\slash'"#);
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(
+        r.stdout.contains(r"set -gx BS 'back\slash';"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn envrc_manpath_add() {
+    let t = TestEnv::new();
+    t.write_envrc("MANPATH_add man");
+
+    let r = t.allow();
+    assert!(r.success);
+    let proj = t.proj.canonicalize().unwrap();
+    assert!(
+        r.stdout.contains(&format!("{}/man", proj.display())),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn envrc_env_vars_required_missing() {
+    let t = TestEnv::new();
+    t.write_envrc("env_vars_required TOTALLY_MISSING_VAR_XYZ");
+
+    let r = t.allow();
+    // env_vars_required returns nonzero, bash -e causes failure
+    assert!(r.stderr.contains("evaluation failed") || r.stderr.contains("required"));
+}
+
+#[test]
+fn envrc_env_vars_required_present() {
+    let t = TestEnv::new();
+    t.write_envrc("env_vars_required HOME\nexport OK=1");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(r.stdout.contains("set -gx OK '1';"));
+}
+
+#[test]
+fn envrc_find_up() {
+    let t = TestEnv::new();
+    // Create a file in the project root, then an envrc in a subdirectory that finds it
+    fs::write(t.proj.join("marker.txt"), "found").unwrap();
+    let sub = t.proj.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join(".envrc"), "export FOUND=$(find_up marker.txt)").unwrap();
+
+    t.allow_in(&sub);
+    let r = t.denv_in(&sub, &["reload"]);
+    assert!(r.success);
+    let proj = t.proj.canonicalize().unwrap();
+    assert!(
+        r.stdout.contains(&format!("{}/marker.txt", proj.display())),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn envrc_source_up() {
+    let t = TestEnv::new();
+    t.write_envrc("export PARENT=1");
+    t.allow();
+
+    let sub = t.proj.join("child");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join(".envrc"), "source_up\nexport CHILD=1").unwrap();
+    t.allow_in(&sub);
+
+    let r = t.denv_in(&sub, &["reload"]);
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("set -gx PARENT '1';"),
+        "stdout: {}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("set -gx CHILD '1';"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+// --- Ported from direnv test suite ---
+
+#[test]
+fn direnv_space_in_directory_name() {
+    let t = TestEnv::new();
+    let space_dir = t.proj.join("space dir");
+    fs::create_dir_all(&space_dir).unwrap();
+    fs::write(
+        space_dir.join(".envrc"),
+        "PATH_add bin\nexport SPACE_DIR=true",
+    )
+    .unwrap();
+
+    t.allow_in(&space_dir);
+    let r = t.denv_in(&space_dir, &["reload"]);
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("set -gx SPACE_DIR 'true';"),
+        "stdout: {}",
+        r.stdout
+    );
+    let canon = space_dir.canonicalize().unwrap();
+    assert!(
+        r.stdout.contains(&format!("{}/bin", canon.display())),
+        "PATH_add should work in space dir: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn direnv_dollar_in_directory_name() {
+    let t = TestEnv::new();
+    // Literal $test directory name — tests path handling with shell metacharacters
+    let dollar_dir = t.proj.join("$test");
+    fs::create_dir_all(&dollar_dir).unwrap();
+    fs::write(dollar_dir.join(".envrc"), "export FOO=bar").unwrap();
+
+    t.allow_in(&dollar_dir);
+    let r = t.denv_in(&dollar_dir, &["reload"]);
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("set -gx FOO 'bar';"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn direnv_ls_colors_complex_value() {
+    let t = TestEnv::new();
+    // LS_COLORS-style value with colons, semicolons, equals inside
+    t.write_envrc(r"export LS_COLORS='*.ogg=38;5;45:*.wav=38;5;45:*.flac=38;5;45'");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(
+        r.stdout
+            .contains("*.ogg=38;5;45:*.wav=38;5;45:*.flac=38;5;45"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn direnv_triple_backslash_value() {
+    let t = TestEnv::new();
+    t.write_envrc(r"export THREE_BS='\\\'");
+
+    let r = t.allow();
+    assert!(r.success);
+    // Value is three literal backslashes: \\\
+    assert!(
+        r.stdout.contains(r"set -gx THREE_BS '\\\\\\';")
+            || r.stdout.contains(r"set -gx THREE_BS '\\\';"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn direnv_pipe_in_value() {
+    let t = TestEnv::new();
+    t.write_envrc(r"export LESSOPEN='||/usr/bin/lesspipe.sh %s'");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("||/usr/bin/lesspipe.sh %s"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn direnv_dotenv_fails_on_missing() {
+    let t = TestEnv::new();
+    t.write_envrc("dotenv .env.nonexistent\nexport AFTER=1");
+
+    let r = t.allow();
+    // dotenv on missing file returns 1, bash -e causes failure
+    assert!(r.stderr.contains("evaluation failed"));
+    assert!(!r.stdout.contains("AFTER"));
+}
+
+#[test]
+fn direnv_dotenv_if_exists_missing() {
+    let t = TestEnv::new();
+    t.write_envrc("dotenv_if_exists .env.nonexistent\nexport OK=1");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(r.stdout.contains("set -gx OK '1';"));
+}
+
+#[test]
+fn direnv_dotenv_if_exists_present() {
+    let t = TestEnv::new();
+    t.write_dotenv("FROM_DOTENV=loaded");
+    t.write_envrc("dotenv_if_exists\nexport ALSO=1");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(r.stdout.contains("FROM_DOTENV"), "stdout: {}", r.stdout);
+    assert!(r.stdout.contains("set -gx ALSO '1';"));
+}
+
+#[test]
+fn direnv_path_rm_glob_pattern() {
+    let t = TestEnv::new();
+    // PATH_rm with glob should remove all matching entries
+    t.write_envrc(
+        r#"export PATH="/usr/local/bin:/home/foo/bin:/usr/bin:/home/foo/.local/bin"
+PATH_rm '/home/foo/*'"#,
+    );
+
+    let r = t.allow();
+    assert!(r.success);
+    let path_line = r
+        .stdout
+        .lines()
+        .find(|l| l.contains("set -gx PATH "))
+        .expect("should export PATH");
+    assert!(
+        !path_line.contains("/home/foo/"),
+        "PATH_rm glob should remove all /home/foo/* entries: {path_line}"
+    );
+    assert!(
+        path_line.contains("/usr/local/bin") && path_line.contains("/usr/bin"),
+        "non-matching entries preserved: {path_line}"
+    );
+}
+
+#[test]
+fn direnv_path_rm_on_custom_var() {
+    let t = TestEnv::new();
+    t.write_envrc(
+        r#"export MYPATH="/a/one:/b/two:/a/three"
+path_rm MYPATH '/a/*'"#,
+    );
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(
+        r.stdout.contains("/b/two"),
+        "non-matching entry preserved: {}",
+        r.stdout
+    );
+    // /a/one and /a/three should be removed
+    let mypath_line = r
+        .stdout
+        .lines()
+        .find(|l| l.contains("MYPATH"))
+        .expect("should export MYPATH");
+    assert!(
+        !mypath_line.contains("/a/"),
+        "path_rm should remove /a/* entries: {mypath_line}"
+    );
+}
+
+#[test]
+fn direnv_source_env_missing_file_fails() {
+    let t = TestEnv::new();
+    // source_env on a file that doesn't exist returns non-zero,
+    // which triggers bash -e — this is expected (use source_env_if_exists for optional)
+    t.write_envrc("source_env nonexistent.sh\nexport AFTER=1");
+
+    let r = t.allow();
+    assert!(r.stderr.contains("evaluation failed"));
+    assert!(!r.stdout.contains("AFTER"));
+}
+
+#[test]
+fn direnv_source_env_if_exists_missing_dir() {
+    let t = TestEnv::new();
+    // source_env_if_exists on a nonexistent file should silently succeed
+    let empty_dir = t.proj.join("empty_sub");
+    fs::create_dir_all(&empty_dir).unwrap();
+    t.write_envrc("source_env_if_exists empty_sub/.envrc\nexport OK=1");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(r.stdout.contains("set -gx OK '1';"), "stdout: {}", r.stdout);
+}
+
+#[test]
+fn direnv_symlink_dir_allow_deny() {
+    let t = TestEnv::new();
+    let real_dir = t.proj.join("real");
+    let link_dir = t.proj.join("linked");
+    fs::create_dir_all(&real_dir).unwrap();
+    fs::write(real_dir.join(".envrc"), "export SYM=yes").unwrap();
+    std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+    // Allow via symlink path — should resolve to the real .envrc
+    let r = t.allow_in(&link_dir);
+    assert!(r.success);
+    assert!(r.stderr.contains("allowed"));
+    assert!(
+        r.stdout.contains("set -gx SYM 'yes';"),
+        "allow via symlink should activate: {}",
+        r.stdout
+    );
+
+    // Deny via symlink should also work
+    let r = t.denv_in(&link_dir, &["deny"]);
+    assert!(r.success);
+    assert!(r.stderr.contains("denied"));
+
+    // Re-allow via real path after denying via symlink — should work
+    let r = t.allow_in(&real_dir);
+    assert!(r.success);
+    assert!(r.stderr.contains("allowed"));
+}
+
+#[test]
+fn direnv_source_up_if_exists_no_parent() {
+    let t = TestEnv::new();
+    // No parent .envrc exists — source_up_if_exists should silently succeed
+    t.write_envrc("source_up_if_exists\nexport OK=1");
+
+    let r = t.allow();
+    assert!(r.success);
+    assert!(r.stdout.contains("set -gx OK '1';"), "stdout: {}", r.stdout);
+}
+
+#[test]
+fn direnv_load_prefix() {
+    let t = TestEnv::new();
+    // Create a prefix-style directory layout
+    let prefix = t.proj.join("local");
+    fs::create_dir_all(prefix.join("bin")).unwrap();
+    fs::create_dir_all(prefix.join("lib")).unwrap();
+    fs::create_dir_all(prefix.join("include")).unwrap();
+    fs::create_dir_all(prefix.join("share/man")).unwrap();
+    t.write_envrc("load_prefix local");
+
+    let r = t.allow();
+    assert!(r.success);
+    let canon = t.proj.canonicalize().unwrap();
+    let stdout = &r.stdout;
+    // Should add bin and sbin to PATH
+    assert!(
+        stdout.contains(&format!("{}/local/bin", canon.display())),
+        "load_prefix should add bin to PATH: {stdout}"
+    );
+    // Should add include to CPATH
+    assert!(
+        stdout.contains("CPATH"),
+        "load_prefix should set CPATH: {stdout}"
+    );
+    // Should add lib to LIBRARY_PATH
+    assert!(
+        stdout.contains("LIBRARY_PATH"),
+        "load_prefix should set LIBRARY_PATH: {stdout}"
+    );
+    // Should add man to MANPATH
+    assert!(
+        stdout.contains("MANPATH"),
+        "load_prefix should set MANPATH: {stdout}"
+    );
+}
+
+#[test]
+fn direnv_path_add_custom_variable() {
+    let t = TestEnv::new();
+    // path_add on a non-PATH variable
+    t.write_envrc("path_add PYTHONPATH lib/python\npath_add PYTHONPATH vendor/python");
+
+    let r = t.allow();
+    assert!(r.success);
+    let canon = t.proj.canonicalize().unwrap();
+    assert!(
+        r.stdout
+            .contains(&format!("{}/lib/python", canon.display())),
+        "stdout: {}",
+        r.stdout
+    );
+    assert!(
+        r.stdout
+            .contains(&format!("{}/vendor/python", canon.display())),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn direnv_exit_code_failure() {
+    let t = TestEnv::new();
+    // Ported from direnv's "failure" scenario: exit 5 in .envrc
+    t.write_envrc("exit 5");
+
+    let r = t.allow();
+    // Should report failure, set dirty flag, and NOT loop forever
+    assert!(r.stderr.contains("evaluation failed"));
+    assert!(r.stdout.contains("__DENV_DIRTY"));
+    assert!(!r.stdout.contains("__DENV_STATE '"));
+}
+
 #[test]
 fn export_requires_valid_shell() {
     let t = TestEnv::new();

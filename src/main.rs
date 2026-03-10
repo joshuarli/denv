@@ -53,8 +53,18 @@ fn find_env_files(start: &Path) -> Option<EnvFiles> {
         if envrc_meta.is_some() || dotenv_meta.is_some() {
             return Some(EnvFiles {
                 dir: buf,
-                envrc: envrc_meta.map(|m| (envrc.unwrap(), m.mtime() as u64)),
-                dotenv: dotenv_meta.map(|m| (dotenv.unwrap(), m.mtime() as u64)),
+                envrc: envrc_meta.map(|m| {
+                    (
+                        envrc.expect("envrc set when envrc_meta set"),
+                        m.mtime() as u64,
+                    )
+                }),
+                dotenv: dotenv_meta.map(|m| {
+                    (
+                        dotenv.expect("dotenv set when dotenv_meta set"),
+                        m.mtime() as u64,
+                    )
+                }),
             });
         }
         if !buf.pop() {
@@ -76,18 +86,19 @@ fn trust_key(path: &Path) -> String {
     s
 }
 
-fn data_dir() -> PathBuf {
+fn data_dir() -> Result<PathBuf, String> {
     if let Some(d) = env::var_os("DENV_DATA_DIR") {
-        return PathBuf::from(d);
+        return Ok(PathBuf::from(d));
     }
     if let Some(d) = env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(d).join("denv");
+        return Ok(PathBuf::from(d).join("denv"));
     }
-    PathBuf::from(env::var_os("HOME").expect("HOME not set")).join(".local/share/denv")
+    let home = env::var_os("HOME").ok_or("HOME, XDG_DATA_HOME, and DENV_DATA_DIR are all unset")?;
+    Ok(PathBuf::from(home).join(".local/share/denv"))
 }
 
-fn allow_dir() -> PathBuf {
-    data_dir().join("allow")
+fn allow_dir() -> Result<PathBuf, String> {
+    Ok(data_dir()?.join("allow"))
 }
 
 fn mtime_of(path: &Path) -> io::Result<u64> {
@@ -96,7 +107,10 @@ fn mtime_of(path: &Path) -> io::Result<u64> {
 
 fn is_allowed(envrc: &Path) -> bool {
     let key = trust_key(envrc);
-    let trust_file = allow_dir().join(&key);
+    let trust_file = match allow_dir() {
+        Ok(d) => d.join(&key),
+        Err(_) => return false,
+    };
     let stored = match fs::read_to_string(&trust_file) {
         Ok(s) => s,
         Err(_) => return false,
@@ -108,25 +122,28 @@ fn is_allowed(envrc: &Path) -> bool {
     stored.trim().parse::<u64>() == Ok(current)
 }
 
-fn cmd_allow(envrc: &Path) {
+fn cmd_allow(envrc: &Path) -> Result<(), String> {
     let key = trust_key(envrc);
-    let dir = allow_dir();
-    fs::create_dir_all(&dir).expect("failed to create allow dir");
-    let mtime = mtime_of(envrc).expect("failed to read .envrc mtime");
-    fs::write(dir.join(&key), mtime.to_string()).expect("failed to write trust file");
+    let dir = allow_dir()?;
+    fs::create_dir_all(&dir).map_err(|e| format!("failed to create allow dir: {e}"))?;
+    let mtime = mtime_of(envrc).map_err(|e| format!("failed to read .envrc mtime: {e}"))?;
+    fs::write(dir.join(&key), mtime.to_string())
+        .map_err(|e| format!("failed to write trust file: {e}"))?;
     eprintln!("denv: allowed {}", envrc.display());
+    Ok(())
 }
 
-fn cmd_deny(envrc: &Path) {
+fn cmd_deny(envrc: &Path) -> Result<(), String> {
     let key = trust_key(envrc);
-    let trust_file = allow_dir().join(&key);
+    let trust_file = allow_dir()?.join(&key);
     match fs::remove_file(&trust_file) {
         Ok(_) => eprintln!("denv: denied {}", envrc.display()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             eprintln!("denv: not currently allowed");
         }
-        Err(e) => panic!("failed to remove trust file: {e}"),
+        Err(e) => return Err(format!("failed to remove trust file: {e}")),
     }
+    Ok(())
 }
 
 // --- Active state ---
@@ -193,12 +210,12 @@ fn unescape_newlines(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn active_path(pid: &str) -> PathBuf {
-    data_dir().join(format!("active_{pid}"))
+fn active_path(pid: &str) -> Result<PathBuf, String> {
+    Ok(data_dir()?.join(format!("active_{pid}")))
 }
 
 fn load_active(pid: &str) -> Option<ActiveState> {
-    let content = fs::read_to_string(active_path(pid)).ok()?;
+    let content = fs::read_to_string(active_path(pid).ok()?).ok()?;
     let mut lines = content.lines();
     let dir = PathBuf::from(lines.next()?);
     let mtimes = lines.next()?;
@@ -223,12 +240,13 @@ fn load_active(pid: &str) -> Option<ActiveState> {
     })
 }
 
-fn save_active(pid: &str, state: &ActiveState) {
-    let dir = data_dir();
-    fs::create_dir_all(&dir).expect("failed to create data dir");
+fn save_active(pid: &str, state: &ActiveState) -> Result<(), String> {
+    let dir = data_dir()?;
+    fs::create_dir_all(&dir).map_err(|e| format!("failed to create data dir: {e}"))?;
     let mut buf = String::new();
     buf.push_str(&state.dir.to_string_lossy());
     buf.push('\n');
+    // write! to String is infallible
     write!(buf, "{} {}", state.envrc_mtime, state.dotenv_mtime).unwrap();
     buf.push('\n');
     for pv in &state.prev {
@@ -245,11 +263,15 @@ fn save_active(pid: &str, state: &ActiveState) {
             }
         }
     }
-    fs::write(active_path(pid), buf).expect("failed to write active file");
+    fs::write(dir.join(format!("active_{pid}")), buf)
+        .map_err(|e| format!("failed to write active file: {e}"))?;
+    Ok(())
 }
 
 fn clear_active(pid: &str) {
-    let _ = fs::remove_file(active_path(pid));
+    if let Ok(path) = active_path(pid) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 // --- .env parser ---
@@ -267,7 +289,7 @@ fn parse_dotenv(content: &str) -> Vec<(&str, Cow<'_, str>)> {
         };
         let key = line[..eq].trim();
         let val = line[eq + 1..].trim();
-        let val: Cow<'_, str> = if val.starts_with('"') && val.ends_with('"') {
+        let val: Cow<'_, str> = if val.len() >= 2 && val.starts_with('"') && val.ends_with('"') {
             let inner = &val[1..val.len() - 1];
             if inner.contains('\\') {
                 let mut out = String::with_capacity(inner.len());
@@ -294,7 +316,7 @@ fn parse_dotenv(content: &str) -> Vec<(&str, Cow<'_, str>)> {
             } else {
                 Cow::Borrowed(inner)
             }
-        } else if val.starts_with('\'') && val.ends_with('\'') {
+        } else if val.len() >= 2 && val.starts_with('\'') && val.ends_with('\'') {
             Cow::Borrowed(&val[1..val.len() - 1])
         } else {
             Cow::Borrowed(val)
@@ -508,7 +530,7 @@ fn eval_env(
     dotenv_entries: &[(&str, Cow<'_, str>)],
     pid: &str,
 ) -> Result<EnvDiff, String> {
-    let data = data_dir();
+    let data = data_dir()?;
     fs::create_dir_all(&data).map_err(|e| format!("create data dir: {e}"))?;
     let before_path = format!("{}/before_{pid}", data.display());
     let after_path = format!("{}/after_{pid}", data.display());
@@ -540,7 +562,12 @@ fn eval_env(
         .arg(&script)
         .current_dir(dir)
         .stdout(stderr_dup)
-        .stderr(io::stderr().as_fd().try_clone_to_owned().unwrap())
+        .stderr(
+            io::stderr()
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(|e| format!("dup stderr for child: {e}"))?,
+        )
         .status()
         .map_err(|e| format!("failed to run bash: {e}"))?;
 
@@ -603,10 +630,10 @@ fn emit_export(w: &mut impl Write, shell: Shell, key: &str, value: &str) {
 fn emit_unset(w: &mut impl Write, shell: Shell, key: &str) {
     match shell {
         Shell::Fish => {
-            writeln!(w, "set -e {key};").unwrap();
+            let _ = writeln!(w, "set -e {key};");
         }
         Shell::Bash | Shell::Zsh => {
-            writeln!(w, "unset {key};").unwrap();
+            let _ = writeln!(w, "unset {key};");
         }
     }
 }
@@ -659,7 +686,7 @@ fn parse_denv_state(s: &str) -> Option<(u64, u64, &str)> {
     Some((envrc_str.parse().ok()?, dotenv_str.parse().ok()?, dir))
 }
 
-fn cmd_export(pid: &str, force: bool, shell: Shell) {
+fn cmd_export(pid: &str, force: bool, shell: Shell) -> Result<(), String> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
@@ -686,7 +713,7 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) {
                 ('-', k)
             }));
         }
-        return;
+        return Ok(());
     };
 
     // Mtimes already captured by find_env_files — zero additional stats
@@ -705,7 +732,7 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) {
                 .canonicalize()
                 .is_ok_and(|c| st_dir == c.to_string_lossy().as_ref()))
     {
-        return;
+        return Ok(());
     }
 
     // Fast path 2: active file check — one disk read (fallback when env var not set)
@@ -716,7 +743,7 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) {
         && state.dotenv_mtime == dotenv_mtime
         && (state.dir == found.dir || state.dir == found.dir.canonicalize().unwrap_or_default())
     {
-        return;
+        return Ok(());
     }
 
     let dir = found
@@ -753,7 +780,7 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) {
             }));
         }
         clear_active(pid);
-        return;
+        return Ok(());
     }
 
     // Parse .env entries (use found.dotenv directly — no canonicalize needed)
@@ -762,7 +789,7 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("denv: read .env: {e}");
-                return;
+                return Ok(());
             }
         },
         None => String::new(),
@@ -790,7 +817,7 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) {
                 emit_export(&mut out, shell, "__DENV_DIR", &dir.to_string_lossy());
                 emit_export(&mut out, shell, "__DENV_DIRTY", "1");
                 emit_unset(&mut out, shell, "__DENV_STATE");
-                return;
+                return Ok(());
             }
         }
     };
@@ -832,7 +859,8 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) {
             dotenv_mtime,
             prev,
         },
-    );
+    )?;
+    Ok(())
 }
 
 // --- Hook ---
@@ -908,14 +936,14 @@ fn run() -> Result<(), String> {
             let (envrc, _) = found.envrc.ok_or("no .envrc found")?;
             let envrc = envrc.canonicalize().unwrap_or(envrc);
             if cmd == "allow" {
-                cmd_allow(&envrc)
+                cmd_allow(&envrc)?;
             } else {
-                cmd_deny(&envrc)
+                cmd_deny(&envrc)?;
             }
             if let (Ok(pid), Ok(shell_str)) = (env::var("__DENV_PID"), env::var("__DENV_SHELL"))
                 && let Some(shell) = Shell::from_str(&shell_str)
             {
-                cmd_export(&pid, true, shell);
+                cmd_export(&pid, true, shell)?;
             }
         }
         "export" => {
@@ -926,7 +954,7 @@ fn run() -> Result<(), String> {
                 .ok_or("usage: denv export <fish|bash|zsh>")?;
             let pid =
                 env::var("__DENV_PID").map_err(|_| "__DENV_PID not set (is the hook loaded?)")?;
-            cmd_export(&pid, false, shell);
+            cmd_export(&pid, false, shell)?;
         }
         "reload" => {
             let pid =
@@ -935,7 +963,7 @@ fn run() -> Result<(), String> {
                 .ok()
                 .and_then(|s| Shell::from_str(&s))
                 .ok_or("__DENV_SHELL not set (is the hook loaded?)")?;
-            cmd_export(&pid, true, shell);
+            cmd_export(&pid, true, shell)?;
         }
         "hook" => {
             let shell_arg = env::args().nth(2);
@@ -958,5 +986,437 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("denv: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    // --- trust_key ---
+
+    #[test]
+    fn trust_key_encodes_path_bytes() {
+        assert_eq!(trust_key(Path::new("/a")), "2f61");
+    }
+
+    #[test]
+    fn trust_key_empty() {
+        assert_eq!(trust_key(Path::new("")), "");
+    }
+
+    #[test]
+    fn trust_key_slash() {
+        assert_eq!(trust_key(Path::new("/")), "2f");
+    }
+
+    // --- escape_newlines / unescape_newlines ---
+
+    #[test]
+    fn escape_borrows_when_no_special() {
+        let r = escape_newlines("hello world");
+        assert!(matches!(r, Cow::Borrowed(_)));
+        assert_eq!(r, "hello world");
+    }
+
+    #[test]
+    fn escape_newline() {
+        assert_eq!(escape_newlines("a\nb"), "a\\nb");
+    }
+
+    #[test]
+    fn escape_backslash() {
+        assert_eq!(escape_newlines("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn escape_mixed() {
+        assert_eq!(escape_newlines("\n\\"), "\\n\\\\");
+    }
+
+    #[test]
+    fn escape_empty() {
+        assert_eq!(escape_newlines(""), "");
+    }
+
+    #[test]
+    fn unescape_borrows_when_no_backslash() {
+        let r = unescape_newlines("hello");
+        assert!(matches!(r, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn unescape_newline() {
+        assert_eq!(unescape_newlines("a\\nb"), "a\nb");
+    }
+
+    #[test]
+    fn unescape_backslash() {
+        assert_eq!(unescape_newlines("a\\\\b"), "a\\b");
+    }
+
+    #[test]
+    fn unescape_unknown_escape_preserved() {
+        assert_eq!(unescape_newlines("a\\xb"), "a\\xb");
+    }
+
+    #[test]
+    fn unescape_trailing_backslash() {
+        assert_eq!(unescape_newlines("a\\"), "a\\");
+    }
+
+    #[test]
+    fn escape_unescape_roundtrip_manual() {
+        for s in ["", "hello", "a\nb", "a\\b", "\n\n", "\\\\", "\n\\x\n"] {
+            let escaped = escape_newlines(s);
+            let rt = unescape_newlines(&escaped);
+            assert_eq!(rt.as_ref(), s, "roundtrip failed for {s:?}");
+        }
+    }
+
+    // --- parse_dotenv ---
+
+    #[test]
+    fn dotenv_empty_input() {
+        assert!(parse_dotenv("").is_empty());
+    }
+
+    #[test]
+    fn dotenv_comments_and_blanks_only() {
+        assert!(parse_dotenv("# comment\n\n# another\n").is_empty());
+    }
+
+    #[test]
+    fn dotenv_simple_pair() {
+        let r = parse_dotenv("FOO=bar");
+        assert_eq!(r, vec![("FOO", Cow::Borrowed("bar"))]);
+    }
+
+    #[test]
+    fn dotenv_multiple_entries() {
+        let r = parse_dotenv("A=1\nB=2\nC=3");
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].0, "A");
+        assert_eq!(r[1].0, "B");
+        assert_eq!(r[2].0, "C");
+    }
+
+    #[test]
+    fn dotenv_equals_in_value() {
+        let r = parse_dotenv("KEY=a=b=c");
+        assert_eq!(r[0].1.as_ref(), "a=b=c");
+    }
+
+    #[test]
+    fn dotenv_empty_value() {
+        let r = parse_dotenv("KEY=");
+        assert_eq!(r[0].1.as_ref(), "");
+    }
+
+    #[test]
+    fn dotenv_empty_key_skipped() {
+        assert!(parse_dotenv("=value").is_empty());
+    }
+
+    #[test]
+    fn dotenv_no_equals_skipped() {
+        assert!(parse_dotenv("NOEQUALS").is_empty());
+    }
+
+    #[test]
+    fn dotenv_export_prefix_stripped() {
+        let r = parse_dotenv("export FOO=bar");
+        assert_eq!(r[0], ("FOO", Cow::Borrowed("bar")));
+    }
+
+    #[test]
+    fn dotenv_double_quoted_strips_quotes() {
+        let r = parse_dotenv(r#"FOO="hello world""#);
+        assert_eq!(r[0].1.as_ref(), "hello world");
+    }
+
+    #[test]
+    fn dotenv_single_quoted_strips_quotes() {
+        let r = parse_dotenv("FOO='hello world'");
+        assert_eq!(r[0].1.as_ref(), "hello world");
+    }
+
+    #[test]
+    fn dotenv_double_quoted_escape_sequences() {
+        assert_eq!(parse_dotenv(r#"A="a\nb""#)[0].1.as_ref(), "a\nb");
+        assert_eq!(parse_dotenv(r#"A="a\tb""#)[0].1.as_ref(), "a\tb");
+        assert_eq!(parse_dotenv(r#"A="a\\b""#)[0].1.as_ref(), "a\\b");
+        assert_eq!(parse_dotenv(r#"A="a\"b""#)[0].1.as_ref(), "a\"b");
+        assert_eq!(parse_dotenv(r#"A="a\$b""#)[0].1.as_ref(), "a$b");
+    }
+
+    #[test]
+    fn dotenv_double_quoted_unknown_escape_preserved() {
+        assert_eq!(parse_dotenv(r#"A="a\xb""#)[0].1.as_ref(), "a\\xb");
+    }
+
+    #[test]
+    fn dotenv_single_quoted_no_escapes() {
+        let r = parse_dotenv(r"A='a\nb'");
+        assert_eq!(r[0].1.as_ref(), r"a\nb");
+    }
+
+    #[test]
+    fn dotenv_whitespace_around_equals() {
+        let r = parse_dotenv("  FOO = bar  ");
+        assert_eq!(r[0].0, "FOO");
+        assert_eq!(r[0].1.as_ref(), "bar");
+    }
+
+    #[test]
+    fn dotenv_unquoted_value_with_hash() {
+        // Unquoted values include # — no inline comment stripping
+        let r = parse_dotenv("FOO=bar#baz");
+        assert_eq!(r[0].1.as_ref(), "bar#baz");
+    }
+
+    #[test]
+    fn dotenv_mismatched_quotes_treated_as_unquoted() {
+        // Starts with " but doesn't end with " — not double-quoted
+        let r = parse_dotenv(r#"FOO="bar"#);
+        assert_eq!(r[0].1.as_ref(), r#""bar"#);
+    }
+
+    #[test]
+    fn dotenv_lone_quote_no_panic() {
+        // Regression: ="  (single " as value) must not panic
+        let r = parse_dotenv("K=\"");
+        assert_eq!(r[0].1.as_ref(), "\"");
+        let r = parse_dotenv("K='");
+        assert_eq!(r[0].1.as_ref(), "'");
+    }
+
+    #[test]
+    fn dotenv_empty_quoted_value() {
+        assert_eq!(parse_dotenv(r#"A="""#)[0].1.as_ref(), "");
+        assert_eq!(parse_dotenv("A=''")[0].1.as_ref(), "");
+    }
+
+    // --- diff_sorted_env ---
+
+    #[test]
+    fn diff_both_empty() {
+        let d = diff_sorted_env(&[], &[]);
+        assert!(d.set.is_empty());
+        assert!(d.unset.is_empty());
+    }
+
+    #[test]
+    fn diff_all_added() {
+        let d = diff_sorted_env(&[], &[("A", "1"), ("B", "2")]);
+        assert_eq!(d.set.len(), 2);
+        assert!(d.unset.is_empty());
+    }
+
+    #[test]
+    fn diff_all_removed() {
+        let d = diff_sorted_env(&[("A", "1"), ("B", "2")], &[]);
+        assert!(d.set.is_empty());
+        assert_eq!(d.unset, ["A", "B"]);
+    }
+
+    #[test]
+    fn diff_value_changed() {
+        let d = diff_sorted_env(&[("A", "1")], &[("A", "2")]);
+        assert_eq!(d.set, [("A".into(), "2".into())]);
+        assert!(d.unset.is_empty());
+    }
+
+    #[test]
+    fn diff_no_changes() {
+        let d = diff_sorted_env(&[("A", "1"), ("B", "2")], &[("A", "1"), ("B", "2")]);
+        assert!(d.set.is_empty());
+        assert!(d.unset.is_empty());
+    }
+
+    #[test]
+    fn diff_interleaved() {
+        let before = [("A", "1"), ("C", "3"), ("E", "5")];
+        let after = [("B", "2"), ("C", "changed"), ("D", "4")];
+        let d = diff_sorted_env(&before, &after);
+        assert_eq!(
+            d.set,
+            [
+                ("B".into(), "2".into()),
+                ("C".into(), "changed".into()),
+                ("D".into(), "4".into()),
+            ]
+        );
+        assert_eq!(d.unset, ["A", "E"]);
+    }
+
+    // --- parse_env_null ---
+
+    #[test]
+    fn env_null_empty() {
+        assert!(parse_env_null(b"").is_empty());
+    }
+
+    #[test]
+    fn env_null_basic_sorted() {
+        let r = parse_env_null(b"FOO=bar\0BAZ=qux\0");
+        assert_eq!(r, [("BAZ", "qux"), ("FOO", "bar")]);
+    }
+
+    #[test]
+    fn env_null_filters_builtins() {
+        let input =
+            b"_=/usr/bin/env\0SHLVL=1\0PWD=/tmp\0OLDPWD=/\0BASH_EXECUTION_STRING=x\0KEEP=y\0";
+        let r = parse_env_null(input);
+        assert_eq!(r, [("KEEP", "y")]);
+    }
+
+    #[test]
+    fn env_null_no_equals_skipped() {
+        let r = parse_env_null(b"NOEQUALS\0A=1\0");
+        assert_eq!(r, [("A", "1")]);
+    }
+
+    #[test]
+    fn env_null_value_with_equals() {
+        let r = parse_env_null(b"K=a=b=c\0");
+        assert_eq!(r, [("K", "a=b=c")]);
+    }
+
+    #[test]
+    fn env_null_consecutive_nulls() {
+        let r = parse_env_null(b"\0\0A=1\0\0");
+        assert_eq!(r, [("A", "1")]);
+    }
+
+    // --- parse_denv_state ---
+
+    #[test]
+    fn state_valid() {
+        assert_eq!(
+            parse_denv_state("123 456 /some/dir"),
+            Some((123, 456, "/some/dir"))
+        );
+    }
+
+    #[test]
+    fn state_dir_with_spaces() {
+        assert_eq!(
+            parse_denv_state("1 2 /path with spaces"),
+            Some((1, 2, "/path with spaces"))
+        );
+    }
+
+    #[test]
+    fn state_empty() {
+        assert!(parse_denv_state("").is_none());
+    }
+
+    #[test]
+    fn state_one_field() {
+        assert!(parse_denv_state("123").is_none());
+    }
+
+    #[test]
+    fn state_two_fields_no_dir() {
+        assert!(parse_denv_state("123 456").is_none());
+    }
+
+    #[test]
+    fn state_non_numeric_mtime() {
+        assert!(parse_denv_state("abc 456 /dir").is_none());
+        assert!(parse_denv_state("123 abc /dir").is_none());
+    }
+
+    // --- push_bash_escaped ---
+
+    #[test]
+    fn bash_escape_simple() {
+        let mut s = String::new();
+        push_bash_escaped(&mut s, "hello");
+        assert_eq!(s, "'hello'");
+    }
+
+    #[test]
+    fn bash_escape_with_single_quote() {
+        let mut s = String::new();
+        push_bash_escaped(&mut s, "it's");
+        assert_eq!(s, "'it'\\''s'");
+    }
+
+    #[test]
+    fn bash_escape_empty() {
+        let mut s = String::new();
+        push_bash_escaped(&mut s, "");
+        assert_eq!(s, "''");
+    }
+
+    #[test]
+    fn bash_escape_only_quotes() {
+        let mut s = String::new();
+        push_bash_escaped(&mut s, "''");
+        assert_eq!(s, "''\\'''\\'''");
+    }
+
+    // --- proptest ---
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+        use std::collections::BTreeMap;
+
+        proptest! {
+            #[test]
+            fn escape_unescape_roundtrip(s in "\\PC*") {
+                let escaped = escape_newlines(&s);
+                let roundtripped = unescape_newlines(&escaped);
+                prop_assert_eq!(roundtripped.as_ref(), s.as_str());
+            }
+
+            #[test]
+            fn parse_dotenv_never_panics(s in "\\PC{0,500}") {
+                let _ = parse_dotenv(&s);
+            }
+
+            #[test]
+            fn parse_env_null_never_panics(data in proptest::collection::vec(any::<u8>(), 0..500)) {
+                let _ = parse_env_null(&data);
+            }
+
+            #[test]
+            fn parse_denv_state_never_panics(s in "\\PC{0,200}") {
+                let _ = parse_denv_state(&s);
+            }
+
+            #[test]
+            fn diff_applied_to_before_yields_after(
+                before_raw in proptest::collection::vec(("[A-Z]{1,3}", "[a-z0-9]{0,10}"), 0..15),
+                after_raw in proptest::collection::vec(("[A-Z]{1,3}", "[a-z0-9]{0,10}"), 0..15),
+            ) {
+                // Deduplicate and sort via BTreeMap
+                let before_map: BTreeMap<&str, &str> =
+                    before_raw.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                let after_map: BTreeMap<&str, &str> =
+                    after_raw.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+                let before: Vec<(&str, &str)> = before_map.iter().map(|(&k, &v)| (k, v)).collect();
+                let after: Vec<(&str, &str)> = after_map.iter().map(|(&k, &v)| (k, v)).collect();
+
+                let diff = diff_sorted_env(&before, &after);
+
+                // Apply diff to before
+                let mut result: BTreeMap<&str, &str> = before_map;
+                for k in &diff.unset {
+                    result.remove(k.as_str());
+                }
+                for (k, v) in &diff.set {
+                    result.insert(k.as_str(), v.as_str());
+                }
+
+                let result_vec: Vec<(&str, &str)> = result.into_iter().collect();
+                prop_assert_eq!(result_vec, after);
+            }
+        }
     }
 }

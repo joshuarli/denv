@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 # none
 
+[dev-dependencies]
+proptest = "1"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
