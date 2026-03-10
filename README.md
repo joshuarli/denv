@@ -2,8 +2,6 @@
 
 Minimal direnv.
 
-direnv runs on every `cd` by nature. It's a larger binary and has a whole Go runtime to initialize. Even if it early exits in the noop case it still costs enough to feel the latency. We solve that by being extremely small and noop exiting as fast as possible.
-
 
 ## Install
 
@@ -50,6 +48,8 @@ When both exist, `.env` is loaded after `.envrc` — `.env` wins on conflicts.
 | `denv reload` | Force re-evaluate |
 
 ## How it works
+
+direnv runs on every `cd` by nature. It's a larger binary and has a whole Go runtime to initialize. Even if it early exits in the noop case it still costs enough to feel the latency. We solve that by being extremely small and noop exiting as fast as possible.
 
 On every `cd`, the shell hook runs `denv export <shell>`. denv walks up from the current directory looking for `.envrc` or `.env`. If found and trusted, it spawns one bash subprocess to evaluate the script, diffs the environment before/after, and emits shell-appropriate commands (`set -gx`/`export`/`unset`) for the shell to source.
 

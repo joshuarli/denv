@@ -899,6 +899,24 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) -> Result<(), String> {
 
 const FISH_HOOK: &str = r#"function __denv_export --on-variable PWD
     set -gx __DENV_PID %self
+    # Noop: still inside the project, no files changed → skip subprocess.
+    # Uses `test -nt` (builtin) against the active state file as a sentinel
+    # to detect edits/deletions without forking.
+    if set -q __DENV_STATE __DENV_SENTINEL
+        set -l p (string split -m 2 ' ' -- $__DENV_STATE)
+        if set -q p[3]
+            set -l dir $p[3]
+            if test "$PWD" = "$dir"; or string match -q -- "$dir/*" $PWD
+                if test -f $__DENV_SENTINEL
+                    and not test "$dir/.envrc" -nt $__DENV_SENTINEL
+                    and not test "$dir/.env" -nt $__DENV_SENTINEL
+                    and begin; test "$p[1]" = 0; or test -f "$dir/.envrc"; end
+                    and begin; test "$p[2]" = 0; or test -f "$dir/.env"; end
+                    return
+                end
+            end
+        end
+    end
     denv export fish | source
 end
 function denv --wraps denv
@@ -909,6 +927,13 @@ function denv --wraps denv
         case '*'
             command denv $argv
     end
+end
+if set -q DENV_DATA_DIR
+    set -g __DENV_SENTINEL $DENV_DATA_DIR/active_$fish_pid
+else if set -q XDG_DATA_HOME
+    set -g __DENV_SENTINEL $XDG_DATA_HOME/denv/active_$fish_pid
+else
+    set -g __DENV_SENTINEL $HOME/.local/share/denv/active_$fish_pid
 end
 set -gx __DENV_PID %self
 set -gx __DENV_SHELL fish
