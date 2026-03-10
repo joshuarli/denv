@@ -731,6 +731,7 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) -> Result<(), String> {
     let Some(found) = found else {
         // No .envrc or .env found — restore if we had active state
         if let Some(state) = load_active(pid) {
+            eprintln!("denv: unloading");
             emit_restore(&state.prev, shell, &mut out);
             emit_unset(&mut out, shell, "__DENV_DIR");
             emit_unset(&mut out, shell, "__DENV_DIRTY");
@@ -831,6 +832,12 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) -> Result<(), String> {
     let dotenv_entries = parse_dotenv(&dotenv_content);
 
     // Eval: .envrc (if present) then .env entries layered on top
+    if envrc.is_some() {
+        eprintln!("denv: loading .envrc");
+    }
+    if found.dotenv.is_some() {
+        eprintln!("denv: loading .env");
+    }
     let diff = if envrc.is_none() {
         // .env-only: diff directly against current env — no subprocess
         let mut set = Vec::new();
