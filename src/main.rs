@@ -742,6 +742,10 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) -> Result<(), String> {
                 };
                 ('-', k)
             }));
+        } else if env::var_os("__DENV_DIRTY").is_some() {
+            // Left an untrusted dir — no active state to restore,
+            // but clear the dirty flag since there's nothing to act on here.
+            emit_unset(&mut out, shell, "__DENV_DIRTY");
         }
         return Ok(());
     };
