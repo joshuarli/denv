@@ -5,11 +5,14 @@ on:
     tags:
       - 'release/*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build release
     runs-on: macos-15
-    timeout-minutes: 10
+    timeout-minutes: 5
     defaults:
       run:
         shell: bash -euo pipefail {0}
@@ -27,4 +30,7 @@ jobs:
       - name: Create GitHub release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" "target/aarch64-apple-darwin/release/denv#denv-${{ github.ref_name }}-aarch64-apple-darwin" --title "${{ github.ref_name }}"
+          VERSION: ${{ github.ref_name }}
+        run: |
+          V="${VERSION#release/}"
+          gh release create "$VERSION" "target/aarch64-apple-darwin/release/denv#denv-${V}-aarch64-apple-darwin" --title "$V"

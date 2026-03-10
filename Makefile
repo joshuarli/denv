@@ -1,6 +1,6 @@
 NAME   := denv
-UNAME  := $(shell uname -m)
-TARGET := $(UNAME)-apple-darwin
+ARCH   := $(shell uname -m | sed 's/arm64/aarch64/')
+TARGET := $(ARCH)-apple-darwin
 
 .PHONY: setup build release install test test-ci pc bump-version
 
