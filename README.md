@@ -2,7 +2,7 @@
 
 Minimal direnv.
 
-direnv runs on every `cd` by nature. It's a larger binary and has a whole Go runtime to initialize. Even if it early exits in the noop case it still costs enough to feel the latency. We solve that by being extremely small and noop exiting as past as possible.
+direnv runs on every `cd` by nature. It's a larger binary and has a whole Go runtime to initialize. Even if it early exits in the noop case it still costs enough to feel the latency. We solve that by being extremely small and noop exiting as fast as possible.
 
 
 ## Install

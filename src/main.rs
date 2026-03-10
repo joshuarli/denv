@@ -687,15 +687,45 @@ fn parse_denv_state(s: &str) -> Option<(u64, u64, &str)> {
 }
 
 fn cmd_export(pid: &str, force: bool, shell: Shell) -> Result<(), String> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-
     // Use $PWD from the environment (zero syscalls) instead of getcwd(2)
     // which does open(".") + fcntl(F_GETPATH) + close on macOS (~1ms).
     // The shell always sets PWD before invoking denv.
     let cwd = env::var_os("PWD")
         .map(PathBuf::from)
         .unwrap_or_else(|| env::current_dir().expect("cannot get cwd"));
+
+    // Fast path: skip the filesystem walk entirely.
+    // Go directly to the cached dir, stat only files that previously existed.
+    // Saves the directory walk and the .env stat when only .envrc is present.
+    // Tradeoff: a brand-new .env added to an already-loaded project won't be
+    // detected until `denv reload` or until .envrc changes.
+    if !force
+        && let Ok(state_str) = env::var("__DENV_STATE")
+        && let Some((st_envrc, st_dotenv, st_dir)) = parse_denv_state(&state_str)
+        && cwd.starts_with(st_dir)
+    {
+        let cached = Path::new(st_dir);
+        let envrc_ok = st_envrc == 0
+            || cached
+                .join(".envrc")
+                .metadata()
+                .ok()
+                .is_some_and(|m| m.is_file() && m.mtime() as u64 == st_envrc);
+        if envrc_ok {
+            let dotenv_ok = st_dotenv == 0
+                || cached
+                    .join(".env")
+                    .metadata()
+                    .ok()
+                    .is_some_and(|m| m.is_file() && m.mtime() as u64 == st_dotenv);
+            if dotenv_ok {
+                return Ok(());
+            }
+        }
+    }
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
     let found = find_env_files(&cwd);
 
     let Some(found) = found else {
@@ -843,7 +873,9 @@ fn cmd_export(pid: &str, force: bool, shell: Shell) -> Result<(), String> {
         &mut out,
         shell,
         "__DENV_STATE",
-        &format!("{} {} {}", envrc_mtime, dotenv_mtime, dir.display()),
+        // Store the raw $PWD-based dir (not canonicalized) so the fast path
+        // can compare directly without a canonicalize() syscall.
+        &format!("{} {} {}", envrc_mtime, dotenv_mtime, found.dir.display()),
     );
     print_summary(
         diff.set

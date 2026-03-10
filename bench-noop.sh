@@ -1,38 +1,54 @@
 #!/bin/bash
 set -euo pipefail
 
-cd "$(dirname "$0")"
-cargo build --quiet
+# Noop latency benchmark: denv vs direnv.
 
-BIN="$(pwd)/target/debug/denv"
+if ! command -v hyperfine &>/dev/null; then
+    echo "error: hyperfine required — brew install hyperfine" >&2
+    exit 1
+fi
+
+PROJ="$(cd "$(dirname "$0")" && pwd)"
+cargo build --release --quiet --manifest-path="$PROJ/Cargo.toml"
+BIN="$PROJ/target/release/denv"
+
 DIR=$(mktemp -d)
 trap 'rm -rf "$DIR"' EXIT
-
-# Resolve symlinks (macOS /var -> /private/var) so __DENV_STATE matches cwd
 DIR=$(cd "$DIR" && pwd -P)
 
-# Set up noop fast path: .env exists, __DENV_STATE matches
-echo "FOO=bar" > "$DIR/.env"
-MTIME=$(stat -f %m "$DIR/.env")
+echo 'export FOO=bar' > "$DIR/.envrc"
+cd "$DIR"
 
+# --- denv setup ---
 export __DENV_PID=$$
 export __DENV_SHELL=fish
-export __DENV_STATE="0 $MTIME $DIR"
+"$BIN" allow >/dev/null 2>&1
 
-# Kill any stale trace sessions
-sudo pkill -f fs_usage 2>/dev/null || true
-sleep 0.3
+MTIME=$(stat -f %m .envrc)
+export __DENV_STATE="$MTIME 0 $DIR"
 
-TRACE=$(mktemp)
-trap 'rm -rf "$DIR" "$TRACE"' EXIT
+OUT=$("$BIN" export fish 2>/dev/null)
+if [ -n "$OUT" ]; then
+    echo "error: denv noop produced output: $OUT" >&2
+    exit 1
+fi
 
-# Start fs_usage, then run denv, then let fs_usage timeout naturally
-sudo fs_usage -w -t 3 denv > "$TRACE" 2>&1 &
-FSPID=$!
-sleep 0.5
+CMDS=(-n baseline "/usr/bin/true" -n denv "$BIN export fish")
 
-(cd "$DIR" && "$BIN" export fish)
+# --- direnv (optional) ---
+if command -v direnv &>/dev/null; then
+    DIRENV_BIN=$(command -v direnv)
+    direnv allow 2>/dev/null
+    eval "$(direnv export bash 2>/dev/null)" || true
 
-wait "$FSPID" 2>/dev/null || true
+    OUT=$(direnv export fish 2>/dev/null) || true
+    if [ -z "$OUT" ]; then
+        CMDS+=(-n direnv "$DIRENV_BIN export fish")
+    else
+        echo "warning: direnv noop produced output, skipping" >&2
+    fi
+else
+    echo "note: direnv not found, benchmarking denv only" >&2
+fi
 
-cat "$TRACE"
+hyperfine --warmup 500 --shell=none "${CMDS[@]}"
