@@ -1,6 +1,5 @@
 NAME   := denv
-ARCH   := $(shell uname -m | sed 's/arm64/aarch64/')
-TARGET := $(ARCH)-apple-darwin
+TARGET := $(shell rustc -vV | awk '/^host:/ {print $$2}')
 
 .PHONY: setup build release install test test-ci pc bump-version
 
