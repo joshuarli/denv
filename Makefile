@@ -19,17 +19,17 @@ release:
 	  --target $(TARGET)
 
 install: release
-	cp target/$(TARGET)/release/$(NAME) ~/.local/bin/
+	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/denv
 
 test:
-	cargo test -- --test-threads=4
+	@OUT=$$(cargo nextest run 2>&1) || { echo "$$OUT"; exit 1; }
 
 # So we don't do duplicate work (building both debug and release) in CI.
 test-ci:
-	cargo test --release -- --test-threads=4
+	@OUT=$$(cargo nextest run --release 2>&1) || { echo "$$OUT"; exit 1; }
 
 pc:
-	prek run --all-files
+	prek --quiet run --all-files
 
 # Usage: make bump-version [V=x.y.z]
 # Without V, increments the patch version.
