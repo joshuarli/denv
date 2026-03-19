@@ -926,12 +926,15 @@ fn run() -> Result<(), String> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| env::current_dir().expect("cannot get cwd"));
             let found = find_env_files(&cwd).ok_or("no .envrc or .env found")?;
-            let (envrc, _) = found.envrc.ok_or("no .envrc found")?;
-            let envrc = envrc.canonicalize().unwrap_or(envrc);
-            if cmd == "allow" {
-                cmd_allow(&envrc)?;
-            } else {
-                cmd_deny(&envrc)?;
+            if let Some((envrc, _)) = found.envrc {
+                let envrc = envrc.canonicalize().unwrap_or(envrc);
+                if cmd == "allow" {
+                    cmd_allow(&envrc)?;
+                } else {
+                    cmd_deny(&envrc)?;
+                }
+            } else if cmd == "deny" {
+                return Err("no .envrc found".to_string());
             }
             if let (Ok(pid), Ok(shell_str)) = (env::var("__DENV_PID"), env::var("__DENV_SHELL"))
                 && let Some(shell) = Shell::from_str(&shell_str)
